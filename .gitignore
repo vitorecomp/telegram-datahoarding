@@ -1,0 +1,36 @@
+# Environment and credentials
+.env
+.env.*
+!.env.example
+
+# Generated archive and internal state
+/data/
+/archive/
+/.tghoard/
+chats.md
+*.session
+*.session-journal
+*.db
+*.db-wal
+*.db-shm
+
+# Chat folders if generated in custom root inside repo
+supergroup_*/
+channel_*/
+group_*/
+dm_*/
+saved_*/
+
+# Python packaging & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
