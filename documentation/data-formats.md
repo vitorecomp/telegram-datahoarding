@@ -69,7 +69,7 @@ The archive is organized first by **content type** and then by chat. Each chat h
 On every `tghoard start`/`sync`, each account's chat folders ("Work", "Personal", shared folders…) are fetched via `messages.getDialogFilters` and written to `<data_dir>/folders.md` (machine-readable copy in `.tghoard/folders.json`):
 
 ```markdown
-## Conta `vitor_lza`
+## Conta `alice`
 ### 💼 Trabalho (id 2)
 - **Chats**: 3
   - **Canal Notícias** [`channel_10`] 📌
