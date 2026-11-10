@@ -13,6 +13,18 @@ A personal Telegram archiver driven by the **CLI**: it saves messages, media, li
 - **Web UI**: select chats and set priorities (they take effect even during a sync), each chat's photo, **downloaded / total on Telegram** (messages, photos, videos, audio, files), the date you joined, a filter by **your Telegram folders**, per-column sorting and progress bars.
 - **Telegram folders**: saved to `folders.md`; `tghoard folder-links` generates the links of every chat in each folder.
 
+## Web UI
+
+Opened by `tghoard sync` (or on its own with `tghoard web`). It's optional: everything it does is editing `chats.md`, which you can also do by hand. *(Screenshots use made-up demo data.)*
+
+**Dashboard** — live progress of the sync: chats and messages this run, download speed, the download pool and auto-throttle, chats in progress, the priority queue and the log.
+
+![Dashboard: live sync progress, download speed chart, download pool, throttle, queue and log](documentation/images/web-dashboard.png)
+
+**Chats** — the `chats.md` editor: check what to download per chat, set priorities, filter by section or Telegram folder, and compare what's archived with the totals on Telegram.
+
+![Chats table: per-chat checkboxes, priority, status and downloaded/total counts for messages, photos, videos, audio and files](documentation/images/web-chats.png)
+
 ## Quick start
 
 **Requirements**: Linux/macOS, Python ≥ 3.11 (or [`uv`](https://docs.astral.sh/uv/), which downloads Python by itself) and a Telegram `api_id`/`api_hash`, created at <https://my.telegram.org> → *API development tools*.
