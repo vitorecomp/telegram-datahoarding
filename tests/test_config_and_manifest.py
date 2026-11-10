@@ -98,12 +98,16 @@ async def test_start_discovery_and_non_destructive_multi_account_merge(tmp_path:
     edited_text = (
         manifest_path.read_text(encoding="utf-8")
         .replace(
-            "- [x] baixar | [ ] photos | [ ] videos | [ ] audio | [ ] files — **Dev Brasil**",
-            "- [x] baixar | [x] photos | [ ] videos | [x] audio | [x] files — **Dev Brasil**",
+            "- [x] baixar | [ ] photos | [ ] videos | [ ] audio | [ ] files | prioridade: 0 "
+            "— **Dev Brasil**",
+            "- [x] baixar | [x] photos | [ ] videos | [x] audio | [x] files | prioridade: 7 "
+            "— **Dev Brasil**",
         )
         .replace(
-            "- [x] baixar | [ ] photos | [ ] videos | [ ] audio | [ ] files — **BotFather**",
-            "- [ ] baixar | [ ] photos | [ ] videos | [ ] audio | [ ] files — **BotFather**",
+            "- [x] baixar | [ ] photos | [ ] videos | [ ] audio | [ ] files | prioridade: 0 "
+            "— **BotFather**",
+            "- [ ] baixar | [ ] photos | [ ] videos | [ ] audio | [ ] files | prioridade: 0 "
+            "— **BotFather**",
         )
     )
     manifest_path.write_text(edited_text, encoding="utf-8")
@@ -139,6 +143,7 @@ async def test_start_discovery_and_non_destructive_multi_account_merge(tmp_path:
     assert sg_after.videos is False
     assert sg_after.audio is True
     assert sg_after.files is True
+    assert sg_after.priority == 7  # priority edits survive `start` too
 
     # BotFather remained unchecked!
     assert reloaded["dm_111_999"].baixar is False

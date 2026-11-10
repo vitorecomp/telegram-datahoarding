@@ -1,85 +1,101 @@
-# AGENTS.md — Diretrizes do Projeto `telegram-datahoarding` (`tghoard`)
+# AGENTS.md — Guidelines for the `telegram-datahoarding` Project (`tghoard`)
 
-Este documento define a arquitetura, invariantes obrigatórias e fluxos de trabalho para agentes de IA que mantenham ou evoluam este repositório.
+This document defines the architecture, mandatory invariants and workflows for AI agents that maintain or evolve this repository.
 
-## 1. Visão Geral
+## 1. Overview
 
-`tghoard` é uma aplicação **100% controlada via CLI** (Python 3.13 + Telethon + Typer + Rich) para arquivamento pessoal de uma ou múltiplas contas do Telegram.
+`tghoard` is a **100% CLI-driven** application (Python 3.13 + Telethon + Typer + Rich) for personal archiving of one or multiple Telegram accounts.
 
-- **Sem Web UI**: toda interação ocorre pela CLI (`tghoard`) e pela edição do arquivo Markdown `<data_dir>/chats.md`.
-- **Arquitetura em Duas Camadas**:
-  1. **Acervo do Usuário em Plain Text (`<data_dir>/<chat_folder>/`)**: JSONs diários particionados, `links.md`, `metadata/*.md` e pastas de mídia (`photos/`, `videos/`, `audio/`, `files/`).
-  2. **Estado Interno em SQLite WAL (`<data_dir>/.tghoard/checkpoint.db` + `sessions/*.session`)**: exclusivamente para checkpoints ACID de paginação, intervalos sincronizados entre contas, localização `O(log N)` de mensagens (`msg_id -> (day_str, part_num)`), fila `pending_media` e deduplicação global de mídias (`media_index`).
+- **CLI first**: every feature exists in the CLI (`tghoard`) + editing `<data_dir>/chats.md`. The **local web UI** (`tghoard sync` opens it alongside in an interactive terminal; `tghoard web` on its own) is just a shortcut for editing `chats.md` and following progress — nothing may depend on it (`--no-web`, cron and pipes work the same).
+- **Two-Layer Architecture**:
+  1. **User Archive in Plain Text, organized by category**: `messages/<folder>/YYYY-MM-ptNNN.json`, `{photos,videos,audio,files}/<folder>/`, `links/<folder>.md` and `metadata/<folder>/*.md`, where `<folder>` = `kebab-title-<id>`.
+  2. **Internal State in SQLite WAL (`<data_dir>/.tghoard/checkpoint.db` + `sessions/*.session`)**: exclusively for ACID pagination checkpoints, ranges synced across accounts, each account's join date in each chat (`chat_membership`), `O(log N)` message lookup (`msg_id -> (day_str, part_num)`), the `pending_media` queue and global media deduplication (`media_index`).
 
-## 2. Invariantes Obrigatórias (Nunca Quebrar)
+## 2. Mandatory Invariants (Never Break)
 
-1. **Parâmetro de Saída (`data_dir`)**:
-   - Todos os artefatos gerados (`chats.md`, `.tghoard/` e pastas de chats) devem ser salvos dentro de `data_dir` (configurado via `TGHOARD_DATA_DIR` no `.env` ou `--data-dir` / `-d` na CLI; valor default: `./data`).
-2. **Fluxo `start` → `chats.md` → `sync`**:
-   - `tghoard start` cria ou mescla de forma **não-destrutiva** `<data_dir>/chats.md`.
-   - Cada chat deve ter os 5 checkboxes: `[x] baixar | [ ] photos | [ ] videos | [ ] audio | [ ] files` (`baixar` marcado por padrão; os outros 4 desmarcados por padrão).
-   - Reexecutar `tghoard start` **jamais** pode sobrescrever marcações `[x]`/`[ ]` já editadas pelo usuário para chats existentes.
-3. **Nomenclatura Uniforme `-ptNNN.json`**:
-   - Todo arquivo JSON em `<chat_folder>/chats/` **deve** seguir o padrão `YYYY-MM-DD-ptNNN.json` (ex.: `2026-11-09-pt000.json`), **inclusive arquivos pequenos que não precisaram ser quebrados** (`-pt000.json`).
-   - Quando o tamanho serializado do dia ultrapassar `max_json_kb` (default `1024 KB`), quebrar sempre entre mensagens (`-pt000.json`, `-pt001.json`, ...), mantendo cada parte como um documento JSON independente e válido.
-4. **Estrutura Obrigatória de Cada Pasta de Chat**:
-   - Dentro de `<data_dir>/<chat_folder>/`:
-     - `links.md`
-     - `chats/` (`YYYY-MM-DD-ptNNN.json`)
-     - `photos/` (fotos de chat, imagens estáticas não-sticker, fotos de stories/perfil)
-     - `videos/` (vídeos, GIFs MP4, *video notes*/"bolinhas", vídeos de stories/perfil)
-     - `audio/` (*voice notes* e arquivos de áudio/música)
-     - `files/` (qualquer anexo que não seja `photo`, `video` nem `audio`: PDFs, ZIPs, docs, stickers, código, etc.)
-     - `metadata/` (`info.md`, `members.md`, `topics.md`, `stories.md`, `deleted_and_edits.md`, `profile_history.md`, `presence.md`, `events_and_admin_log.md`)
-5. **Imutabilidade Histórica**:
-   - Eventos remotos de exclusão (`UpdateDeleteMessages`) **nunca** apagam mensagens ou arquivos locais; apenas marcam `"is_deleted": true` no JSON da parte correspondente e registram em `metadata/deleted_and_edits.md`.
-   - Edições (`UpdateEditMessage`) **nunca** descartam o texto anterior; empurram a versão prévia para `"revisions": [...]`.
-6. **Deduplicação Multi-Conta**:
-   - Duas contas no mesmo canal (`channel_<id>`), supergrupo (`supergroup_<id>`) ou grupo básico (`group_<id>`) compartilham a **mesma pasta** e a **mesma entrada** no `chats.md`.
-   - Mensagens já cobertas em `chat_synced_ranges` e mídias já registradas em `media_index` (`(tg_type, tg_id)`) não devem ser baixadas novamente da rede (utilizar hardlink `os.link` com fallback para cópia local quando a mesma mídia aparecer em pastas diferentes).
-7. **Escrita Atômica e Segurança**:
-   - Gravar arquivos `.json` e `.md` sempre via arquivo temporário no mesmo diretório + `os.replace`.
-   - Nunca versionar `.env`, `/data/`, `*.session*` ou `*.db*` no Git. Diretório `.tghoard/sessions/` deve ter permissão `0700` e arquivos `.session` permissão `0600`.
+1. **Output Parameter (`data_dir`)**:
+   - All generated artifacts (`chats.md`, `.tghoard/` and chat folders) must be saved inside `data_dir` (configured via `TGHOARD_DATA_DIR` in `.env` or `--data-dir` / `-d` on the CLI; default value: `./data`).
+2. **`start` → `chats.md` → `sync` Flow**:
+   - `tghoard start` creates or **non-destructively** merges `<data_dir>/chats.md`.
+   - Each chat must have the 5 checkboxes + priority: `[x] baixar | [ ] photos | [ ] videos | [ ] audio | [ ] files | prioridade: 0` (`baixar` = download this chat, checked by default; the other 4 unchecked; `prioridade` = priority, default `0`, higher syncs first). These Portuguese tokens (and the section headings such as `## Grupos e Supergrupos`) are part of the file format and must not be renamed.
+   - Re-running `tghoard start` must **never** overwrite `[x]`/`[ ]` selections or the `prioridade` already edited by the user (by hand or through the web UI) for existing chats.
+   - `sync` re-reads `chats.md` each time a chat starts: priority/checkbox changes made during a sync apply to the chats that have not started yet.
+3. **Uniform Monthly `-ptNNN.json` Naming**:
+   - Every file in `messages/<folder>/` **must** follow `YYYY-MM-ptNNN.json` (e.g. `2026-11-pt000.json`), **including small months that did not need to be split** (`-pt000.json`).
+   - When the serialized size of a month exceeds `max_json_kb` (default `1024 KB`), always split between messages (`-pt000.json`, `-pt001.json`, ...), keeping each part an independent, valid JSON document. Media file names keep the full date (`2026-11-09_<msg_id>_...`).
+4. **Mandatory Per-Category Layout** (`<folder>` = `kebab-title-<id>`, e.g. `python-brasil-1234567890`; DMs `joao-<lo>-<hi>`; collisions get a `-2` suffix):
+   - `messages/<folder>/` (`YYYY-MM-ptNNN.json`)
+   - `photos/<folder>/` (chat photos, static non-sticker images, story/profile photos)
+   - `videos/<folder>/` (videos, MP4 GIFs, *video notes* ("round videos"), story/profile videos)
+   - `audio/<folder>/` (*voice notes* and audio/music files)
+   - `files/<folder>/` (any attachment that is not a `photo`, `video` or `audio`: PDFs, ZIPs, docs, stickers, code, etc.)
+   - `links/<folder>.md`
+   - `folders.md` at the root (Telegram folders per account; generated on every `start`/`sync`)
+   - `metadata/<folder>/` (`info.md`, `members.md`, `topics.md`, `stories.md`, `deleted_and_edits.md`, `profile_history.md`, `presence.md`, `events_and_admin_log.md`)
+   - **Plain-text identity**: the first line of `metadata/<folder>/info.md` contains `` (`<chat_key>`) ``; folders are resolved by it (never by name), so renamed chats keep their folder and `checkpoint.db` can be rebuilt without internal state.
+   - `media.path` in the JSON files is relative to `data_dir` (`photos/<folder>/<file>`).
+   - Folders are created **only when a file is written to them** (never empty media folders).
+   - Layout changes require a versioned migration in `src/tghoard/migrations/` (`tghoard migrate` shows the plan; `--apply` runs it). Commands that touch the archive refuse to run while migrations are pending.
+5. **Historical Immutability**:
+   - Remote deletion events (`UpdateDeleteMessages`) **never** delete local messages or files; they only set `"is_deleted": true` in the JSON of the corresponding part and record it in `metadata/deleted_and_edits.md`.
+   - Edits (`UpdateEditMessage`) **never** discard the previous text; they push the prior version into `"revisions": [...]`.
+6. **Multi-Account Deduplication**:
+   - Two accounts in the same channel (`channel_<id>`), supergroup (`supergroup_<id>`) or basic group (`group_<id>`) share the **same folder** and the **same entry** in `chats.md`.
+   - Messages already covered in `chat_synced_ranges` and media already registered in `media_index` (`(tg_type, tg_id)`) must not be downloaded from the network again (use an `os.link` hardlink with fallback to a local copy when the same media appears in different folders).
+7. **Atomic Writes and Security**:
+   - Always write `.json` and `.md` files via a temporary file in the same directory + `os.replace`.
+   - Never commit `.env`, `/data/`, `*.session*` or `*.db*` to Git. The `.tghoard/sessions/` directory must have `0700` permissions and `.session` files `0600` permissions.
 
-## 3. Mapa do Código
+## 3. Code Map
 
-- `src/tghoard/config.py`: Carregamento de `.env` (`pydantic-settings`) e parâmetros globais.
+- `src/tghoard/config.py`: Loading of `.env` (`pydantic-settings`) and global parameters.
 - `src/tghoard/storage/`:
-  - `atomic.py`: Escrita atômica plain-text e helpers de intervalos.
-  - `paths.py`: Identidade canônica (`chat_key`), slugs de pastas e paths `-ptNNN.json`.
-  - `chats_manifest.py`: Parser tolerante e gerador/merger de `<data_dir>/chats.md`.
-  - `checkpoint_db.py`: SQLite WAL (`checkpoint.db`), cursores, ranges, `message_locator`, `pending_media` e `media_index`.
-  - `chat_writer.py`: Leitura/escrita particionada de `chats/YYYY-MM-DD-ptNNN.json`, revisões e soft-delete.
-  - `markdown_writer.py`: Geração de `links.md` e `metadata/*.md`.
-  - `media_manager.py`: Classificador determinístico (`photos`/`videos`/`audio`/`files`), hardlinks e download.
+  - `atomic.py`: Atomic plain-text writes and range helpers.
+  - `paths.py`: Canonical identity (`chat_key`), `ChatPaths` (per-category layout), `kebab-title-<id>` folders and `YYYY-MM-ptNNN.json` paths.
+  - `chats_manifest.py`: Tolerant parser, generator/merger of `<data_dir>/chats.md`, `update_chat_selections` (web UI edits) and `ManifestSource` (re-reading during the sync).
+  - `chat_stats.py`: Per-chat statistics (messages, media per category, links, sizes) for the web UI.
+  - `checkpoint_db.py`: SQLite WAL (`checkpoint.db`), cursors, ranges, `message_locator`, `pending_media` and `media_index`.
+  - `chat_writer.py`: Partitioned reading/writing of `messages/<folder>/YYYY-MM-ptNNN.json`, revisions and soft-delete.
+  - `markdown_writer.py`: Generation of `links/<folder>.md` and `metadata/<folder>/*.md`.
+  - `media_manager.py`: Deterministic classifier (`photos`/`videos`/`audio`/`files`), hardlinks and download (`needs_network` decides inline vs. pool).
+  - `process_lock.py`: Single-writer `flock` on `.tghoard/archive.lock` (every command that writes to the archive takes it; a second writer exits with code 3).
 - `src/tghoard/telegram/`:
-  - `accounts.py`: Autenticação e gerenciamento multi-conta (`SQLiteSession`).
-  - `takeout.py`: Sessão Takeout (`InitTakeoutSessionRequest`) com fallback automático.
-  - `throttler.py`: Controle de concorrência, *jitter* e espera automática em `FloodWaitError`.
+  - `accounts.py`: Authentication and multi-account management (`SQLiteSession`).
+  - `entities.py`: Normalization of Telethon entities (canonical `chat_key`, title, section, join date) and messages (`serialize_message_to_dict`) into plain dicts.
+  - `takeout.py`: Takeout session (`InitTakeoutSessionRequest`) with automatic fallback.
+  - `throttler.py`: `RateLimiter` (fixed API slots, *jitter*, automatic waiting on `FloodWaitError`) and `retry_transient` (backoff on 500s/timeouts); Telethon's spurious `CancelledError` on a dropped connection is treated as a transient `ConnectionError`.
+  - `flood_control.py`: Per-account auto-throttle (`FloodController`): history FloodWaits raise the page pause, download FloodWaits (`GetFile*`) cut pool parallelism geometrically, quiet periods recover linearly; `DynamicSlots` (FIFO semaphore with a runtime limit).
 - `src/tghoard/sync/`:
-  - `discovery.py`: Implementação do `tghoard start`.
-  - `pts_diff.py`: Replay offline de `getDifference` / `getChannelDifference`.
-  - `messages_sync.py`: Sync incremental por intervalos faltantes e drenagem de `pending_media`.
-  - `metadata_sync.py`: Sync de perfis, membros, tópicos, stories, Admin Log e presença.
-  - `watcher.py`: Escuta em tempo real opcional (`tghoard watch`).
-  - `rebuilder.py`: Reconstrução de `checkpoint.db` e Markdown a partir do plain text.
-  - `orchestrator.py`: Orquestração multi-conta do `tghoard sync`.
-- `src/tghoard/cli.py`: Definição completa dos subcomandos Typer.
+  - `discovery.py`: Implementation of `tghoard start`.
+  - `pts_diff.py`: Offline replay of `getDifference` / `getChannelDifference`.
+  - `media_pool.py`: Per-account download pool (fixed workers + bounded channel, per-chat cancellation).
+  - `messages_sync.py`: Incremental sync by missing ranges and draining of `pending_media`.
+  - `metadata_sync.py`: Sync of profiles, members, topics, stories, Admin Log and presence.
+  - `watcher.py`: Optional real-time listener (`tghoard watch`).
+  - `rebuilder.py`: Rebuilding of `checkpoint.db` and Markdown from the plain text.
+  - `folders_sync.py`: Telegram chat folders (`messages.getDialogFilters`) → `<data_dir>/folders.md` + `.tghoard/folders.json` (web UI filter).
+  - `orchestrator.py`: Multi-account orchestration of `tghoard sync` (priority queue, re-read from `chats.md`).
+  - `live_state.py`: Live sync state (thread-safe) consumed by the web UI + `wait_for_user` (Enter or the web UI button).
+  - `reporter.py`: Progress output with timestamp/chat prefix (`info` always; `debug` with `--verbose`).
+- `src/tghoard/web/`: Optional local web UI (`server.py` stdlib HTTP on `127.0.0.1` only, `telegram_bridge.py` chat photos and Telegram totals with caching, `static/index.html`).
+- `src/tghoard/utils/`: Offline utilities over the archive (`folder_links.py` → `tghoard folder-links`, `verify_media.py` → `tghoard verify-media`).
+- `src/tghoard/migrations/`: Versioned archive migrations (`m0001_category_first_layout.py`, ...), applied by `tghoard migrate --apply`.
+- `src/tghoard/cli.py`: Complete definition of the Typer subcommands.
 
-## 4. Documentação Detalhada
+## 4. Detailed Documentation
 
-Consulte sempre e mantenha sincronizados os documentos em [`documentation/`](./documentation/):
+Always consult and keep in sync the documents in [`documentation/`](./documentation/):
 - `documentation/architecture.md`
 - `documentation/data-formats.md`
 - `documentation/multi-account-and-dedup.md`
 - `documentation/cli-reference.md`
 
-## 5. Comandos de Desenvolvimento e Verificação
+## 5. Development and Verification Commands
 
 ```bash
-# Executar suíte completa de testes
+# Run the full test suite
 .venv/bin/pytest -v
 
-# Executar linter e checagem de formatação
+# Run the linter and formatting check
 .venv/bin/ruff check src tests
 ```

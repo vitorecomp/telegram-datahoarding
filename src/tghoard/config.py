@@ -29,7 +29,32 @@ class AppConfig(BaseSettings):
     data_dir: Path = Field(default=Path("./data"), validation_alias="TGHOARD_DATA_DIR")
     max_json_kb: int = Field(default=1024, ge=4, validation_alias="TGHOARD_MAX_JSON_KB")
     max_media_mb: int = Field(default=50, ge=0, validation_alias="TGHOARD_MAX_MEDIA_MB")
-    concurrency: int = Field(default=3, ge=1, le=16, validation_alias="TGHOARD_CONCURRENCY")
+    concurrency: int = Field(default=5, ge=1, le=32, validation_alias="TGHOARD_CONCURRENCY")
+    parallel_chats: int = Field(default=4, ge=1, le=16, validation_alias="TGHOARD_PARALLEL_CHATS")
+    # Pause (s) between 100-message history pages. Telethon's default is 1s for big chats,
+    # which caps a chat at ~100 msgs/s; FloodWaits are handled anyway (auto-sleep + retry).
+    history_wait: float = Field(default=0.0, ge=0, le=10, validation_alias="TGHOARD_HISTORY_WAIT")
+    # Media download pool: max downloads waiting in the channel before the message reader
+    # is held back (backpressure)
+    download_queue: int = Field(
+        default=1024, ge=16, le=1_000_000, validation_alias="TGHOARD_DOWNLOAD_QUEUE"
+    )
+    # Chat metadata (full info, members, stories, admin log, profile photos) is refreshed at
+    # most every N hours per chat (0 = every sync); messages/media are always synced.
+    metadata_every_hours: float = Field(
+        default=24.0, ge=0, validation_alias="TGHOARD_METADATA_EVERY_HOURS"
+    )
+    # Auto-throttle: adapt history pause / parallelism to FloodWaits (floors/ceilings above)
+    auto_throttle: bool = Field(default=True, validation_alias="TGHOARD_AUTO_THROTTLE")
+    # Geometric cut on each download FloodWait: parallelism x ratio (0.5 = halve)
+    throttle_cut_ratio: float = Field(
+        default=0.5, gt=0, lt=1, validation_alias="TGHOARD_THROTTLE_CUT_RATIO"
+    )
+    # Quiet period (s) after which the auto-throttle adds +1 download / halves the pause
+    throttle_recover_secs: float = Field(
+        default=20.0, ge=1, le=3600, validation_alias="TGHOARD_THROTTLE_RECOVER_SECS"
+    )
+    web_port: int = Field(default=8765, ge=0, le=65535, validation_alias="TGHOARD_WEB_PORT")
     sync_mode: SyncMode = Field(default="auto", validation_alias="TGHOARD_SYNC_MODE")
     audit_window: int = Field(default=200, ge=10, validation_alias="TGHOARD_AUDIT_WINDOW")
 
@@ -96,7 +121,11 @@ class AppConfig(BaseSettings):
         max_json_kb: int | None = None,
         max_media_mb: int | None = None,
         concurrency: int | None = None,
+        parallel_chats: int | None = None,
         sync_mode: SyncMode | None = None,
+        history_wait: float | None = None,
+        auto_throttle: bool | None = None,
+        metadata_every_hours: float | None = None,
     ) -> AppConfig:
         updates: dict[str, Any] = {}
         if data_dir is not None:
@@ -107,6 +136,14 @@ class AppConfig(BaseSettings):
             updates["max_media_mb"] = max_media_mb
         if concurrency is not None:
             updates["concurrency"] = concurrency
+        if parallel_chats is not None:
+            updates["parallel_chats"] = parallel_chats
+        if history_wait is not None:
+            updates["history_wait"] = history_wait
+        if auto_throttle is not None:
+            updates["auto_throttle"] = auto_throttle
+        if metadata_every_hours is not None:
+            updates["metadata_every_hours"] = metadata_every_hours
         if sync_mode is not None:
             updates["sync_mode"] = sync_mode
         return self.model_copy(update=updates)

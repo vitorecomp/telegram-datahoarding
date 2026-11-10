@@ -6,14 +6,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
 from telethon.tl import functions as tl_functions
 from telethon.tl import types as tl_types
 
-from tghoard.storage.chat_writer import ChatDayWriter
+from tghoard.storage.chat_writer import ChatPartWriter
 from tghoard.storage.chats_manifest import ChatSelection
-from tghoard.storage.checkpoint_db import CheckpointDB
+from tghoard.storage.checkpoint_db import CheckpointDB, LocatedMessage
 from tghoard.storage.markdown_writer import rebuild_links_and_audit_md_from_parts
-from tghoard.storage.paths import resolve_chat_dir
+from tghoard.storage.paths import ChatPaths, month_from_iso, resolve_chat_paths
+from tghoard.sync.reporter import NULL_REPORTER, SyncReporter
 from tghoard.telegram.entities import serialize_message_to_dict, to_utc_iso
 from tghoard.telegram.throttler import RateLimiter
 
@@ -25,6 +27,55 @@ class PtsDiffStats:
     touched_chats: set[str] = field(default_factory=set)
     too_long_channels: set[int] = field(default_factory=set)
     global_too_long: bool = False
+    # Deletions whose archived record could not be found in any part of its month
+    # (`chat_key#msg_id`); they are reported instead of being silently dropped.
+    delete_targets_missing: list[str] = field(default_factory=list)
+
+
+def _heal_locator(
+    db: CheckpointDB, loc: LocatedMessage, *, month: str, part_num: int, is_deleted: bool
+) -> None:
+    """Point a stale locator (wrong part, legacy full-date day_str) at the actual part."""
+    if loc.day_str == month and loc.part_num == part_num:
+        return
+    db.record_messages_batch(
+        chat_key=loc.chat_key,
+        account_id=None,
+        locators=[(loc.canonical_key, month, part_num, loc.sender_id, is_deleted)],
+        account_mappings=[],
+    )
+
+
+def _mark_located_deleted(
+    *,
+    writer: ChatPartWriter,
+    db: CheckpointDB,
+    loc: LocatedMessage,
+    chat_paths: ChatPaths,
+    title: str,
+    msg_id: int,
+    source: str,
+    reporter: SyncReporter,
+) -> bool:
+    """Flag the archived record of `loc` deleted; report (never drop silently) if not found."""
+    month = month_from_iso(loc.day_str)
+    hit = writer.locate_and_mark_deleted(
+        chat_paths=chat_paths,
+        month=month,
+        part_num=loc.part_num,
+        canonical_key=loc.canonical_key,
+        source=source,
+    )
+    if hit is None:
+        reporter.warn(
+            f"⚠ {escape(f'[{title}]')} msg #{msg_id} was deleted on Telegram, but its archived "
+            f"record was not found in {escape(chat_paths.folder)}/{month}-pt*.json "
+            "(deletion not recorded)"
+        )
+        return False
+    db.mark_locator_deleted(loc.chat_key, loc.canonical_key)
+    _heal_locator(db, loc, month=month, part_num=hit[0], is_deleted=True)
+    return True
 
 
 def _apply_deleted_msg_ids(
@@ -35,9 +86,10 @@ def _apply_deleted_msg_ids(
     selections: dict[str, ChatSelection],
     data_dir: Path,
     db: CheckpointDB,
-    writer: ChatDayWriter,
+    writer: ChatPartWriter,
     source: str,
     stats: PtsDiffStats,
+    reporter: SyncReporter = NULL_REPORTER,
 ) -> None:
     for msg_id in msg_ids:
         located_list = db.locate_by_account_msg(account_id, int(msg_id), chat_key=chat_key_hint)
@@ -46,18 +98,21 @@ def _apply_deleted_msg_ids(
             if sel is not None and not sel.baixar:
                 continue
             title = sel.title if sel is not None else loc.chat_key
-            chat_dir = resolve_chat_dir(data_dir, loc.chat_key, title)
-            updated = writer.mark_message_deleted(
-                chat_dir=chat_dir,
-                day_str=loc.day_str,
-                part_num=loc.part_num,
-                canonical_key=loc.canonical_key,
+            chat_paths = resolve_chat_paths(data_dir, loc.chat_key, title)
+            if _mark_located_deleted(
+                writer=writer,
+                db=db,
+                loc=loc,
+                chat_paths=chat_paths,
+                title=title,
+                msg_id=int(msg_id),
                 source=source,
-            )
-            if updated is not None:
-                db.mark_locator_deleted(loc.chat_key, loc.canonical_key)
+                reporter=reporter,
+            ):
                 stats.deleted_marked += 1
                 stats.touched_chats.add(loc.chat_key)
+            else:
+                stats.delete_targets_missing.append(f"{loc.chat_key}#{msg_id}")
 
 
 def _apply_edited_message(
@@ -68,7 +123,7 @@ def _apply_edited_message(
     selections: dict[str, ChatSelection],
     data_dir: Path,
     db: CheckpointDB,
-    writer: ChatDayWriter,
+    writer: ChatPartWriter,
     stats: PtsDiffStats,
 ) -> None:
     msg_id = getattr(msg, "id", None)
@@ -80,20 +135,29 @@ def _apply_edited_message(
         if sel is not None and not sel.baixar:
             continue
         title = sel.title if sel is not None else loc.chat_key
-        chat_dir = resolve_chat_dir(data_dir, loc.chat_key, title)
+        chat_paths = resolve_chat_paths(data_dir, loc.chat_key, title)
         incoming_dict = serialize_message_to_dict(
             msg,
             account_id=account_id,
             canonical_key=loc.canonical_key,
         )
-        part_map, edits = writer.upsert_day_messages(
-            chat_dir=chat_dir,
+        month = month_from_iso(loc.day_str)
+        part_map, edits = writer.upsert_month_messages(
+            chat_paths=chat_paths,
             chat_key=loc.chat_key,
             chat_title=title,
-            day_str=loc.day_str,
+            month=month,
             incoming_messages=[incoming_dict],
         )
-        db.update_day_part_numbers(loc.chat_key, loc.day_str, part_map)
+        db.update_day_part_numbers(loc.chat_key, month, part_map)
+        if loc.canonical_key in part_map:
+            _heal_locator(
+                db,
+                loc,
+                month=month,
+                part_num=part_map[loc.canonical_key],
+                is_deleted=loc.is_deleted,
+            )
         if edits:
             stats.edits_recorded += len(edits)
             stats.touched_chats.add(loc.chat_key)
@@ -107,8 +171,9 @@ async def sync_account_pts_diff(
     channel_entities: dict[str, Any],
     data_dir: Path,
     db: CheckpointDB,
-    writer: ChatDayWriter,
+    writer: ChatPartWriter,
     limiter: RateLimiter,
+    reporter: SyncReporter = NULL_REPORTER,
 ) -> PtsDiffStats:
     """Replay offline `getDifference` & `getChannelDifference` to catch deletes and edits."""
     stats = PtsDiffStats()
@@ -182,6 +247,7 @@ async def sync_account_pts_diff(
                         writer=writer,
                         source="pts_diff",
                         stats=stats,
+                        reporter=reporter,
                     )
                 elif isinstance(upd, tl_types.UpdateEditMessage) or upd_cls == "UpdateEditMessage":
                     _apply_edited_message(
@@ -280,6 +346,7 @@ async def sync_account_pts_diff(
                             writer=writer,
                             source="pts_diff",
                             stats=stats,
+                            reporter=reporter,
                         )
                     elif (
                         isinstance(upd, tl_types.UpdateEditChannelMessage)
@@ -305,8 +372,8 @@ async def sync_account_pts_diff(
     for chat_key in stats.touched_chats:
         sel = selections.get(chat_key)
         title = sel.title if sel is not None else chat_key
-        chat_dir = resolve_chat_dir(data_dir, chat_key, title)
-        rebuild_links_and_audit_md_from_parts(chat_dir, chat_key=chat_key, chat_title=title)
+        chat_paths = resolve_chat_paths(data_dir, chat_key, title)
+        rebuild_links_and_audit_md_from_parts(chat_paths, chat_key=chat_key, chat_title=title)
 
     return stats
 
@@ -320,9 +387,10 @@ async def reconcile_recent_window(
     chat_title: str,
     data_dir: Path,
     db: CheckpointDB,
-    writer: ChatDayWriter,
+    writer: ChatPartWriter,
     limiter: RateLimiter,
     window_size: int = 200,
+    reporter: SyncReporter = NULL_REPORTER,
 ) -> tuple[int, int]:
     """Audit the most recent `window_size` synced messages when `DifferenceTooLong` occurs."""
     rows = db._conn.execute(
@@ -352,7 +420,7 @@ async def reconcile_recent_window(
             if mid is not None:
                 by_id[int(mid)] = item
 
-    chat_dir = resolve_chat_dir(data_dir, chat_key, chat_title)
+    chat_paths = resolve_chat_paths(data_dir, chat_key, chat_title)
     deleted_cnt = 0
     edited_cnt = 0
 
@@ -364,34 +432,45 @@ async def reconcile_recent_window(
         was_deleted = bool(r["is_deleted"])
 
         remote_msg = by_id.get(mid)
+        loc = LocatedMessage(
+            chat_key=chat_key,
+            canonical_key=ckey,
+            day_str=day_str,
+            part_num=part_num,
+            sender_id=None,
+            is_deleted=was_deleted,
+        )
         if remote_msg is None:
-            if not was_deleted:
-                updated = writer.mark_message_deleted(
-                    chat_dir=chat_dir,
-                    day_str=day_str,
-                    part_num=part_num,
-                    canonical_key=ckey,
-                    source="window_audit",
-                )
-                if updated is not None:
-                    db.mark_locator_deleted(chat_key, ckey)
-                    deleted_cnt += 1
+            if not was_deleted and _mark_located_deleted(
+                writer=writer,
+                db=db,
+                loc=loc,
+                chat_paths=chat_paths,
+                title=chat_title,
+                msg_id=mid,
+                source="window_audit",
+                reporter=reporter,
+            ):
+                deleted_cnt += 1
         elif to_utc_iso(getattr(remote_msg, "edit_date", None)) is not None:
             inc = serialize_message_to_dict(
                 remote_msg,
                 account_id=account_id,
                 canonical_key=ckey,
             )
-            part_map, edits = writer.upsert_day_messages(
-                chat_dir=chat_dir,
+            month = month_from_iso(day_str)
+            part_map, edits = writer.upsert_month_messages(
+                chat_paths=chat_paths,
                 chat_key=chat_key,
                 chat_title=chat_title,
-                day_str=day_str,
+                month=month,
                 incoming_messages=[inc],
             )
-            db.update_day_part_numbers(chat_key, day_str, part_map)
+            db.update_day_part_numbers(chat_key, month, part_map)
+            if ckey in part_map:
+                _heal_locator(db, loc, month=month, part_num=part_map[ckey], is_deleted=was_deleted)
             edited_cnt += len(edits)
 
     if deleted_cnt or edited_cnt:
-        rebuild_links_and_audit_md_from_parts(chat_dir, chat_key=chat_key, chat_title=chat_title)
+        rebuild_links_and_audit_md_from_parts(chat_paths, chat_key=chat_key, chat_title=chat_title)
     return deleted_cnt, edited_cnt

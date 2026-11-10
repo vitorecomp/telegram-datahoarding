@@ -1,34 +1,36 @@
-# Múltiplas Contas e Deduplicação Cruzada
+# Multiple Accounts and Cross-Account Deduplication
 
-O `tghoard` foi projetado desde a base para permitir que **duas ou mais contas do Telegram** salvem seus dados no mesmo diretório `--data-dir` (ex.: `./data`) sem duplicar trabalho de rede nem espaço em disco.
+`tghoard` was designed from the ground up to let **two or more Telegram accounts** save their data into the same `--data-dir` directory (e.g. `./data`) without duplicating network work or disk space.
 
-## 1. Identidade Canônica de Pastas (`chat_key`)
+## 1. Canonical Folder Identity (`chat_key`)
 
-| Tipo de Diálogo | Formato do `chat_key` | Comportamento entre Conta A (`111`) e Conta B (`222`) |
+| Dialog Type | `chat_key` Format | Behavior between Account A (`111`) and Account B (`222`) |
 | :--- | :--- | :--- |
-| **Canal (`Channel` broadcast)** | `channel_<channel_id>` | **Mesma pasta e mesma linha no `chats.md`**. `msg_id` é global no canal. |
-| **Supergrupo / Fórum (`Megagroup`)** | `supergroup_<channel_id>` | **Mesma pasta e mesma linha no `chats.md`**. `msg_id` é global no supergrupo. |
-| **Grupo Básico Legado (`Chat`)** | `group_<chat_id>` | **Mesma pasta e mesma linha no `chats.md`**. `msg_id` é por conta; deduplica por fingerprint determinístico. |
-| **Chat Privado 1:1 (`User` / `Bot`)** | `dm_<min_id>_<max_id>` |Conversas com terceiros ficam isoladas (`dm_111_333` vs. `dm_222_333`), mas conversa direta entre Conta A e Conta B (`dm_111_222`) compartilha a mesma pasta sem duplicar. |
-| **Saved Messages (`Self`)** | `saved_<self_id>` | Isolada por conta (`saved_111` e `saved_222`). |
+| **Channel (`Channel` broadcast)** | `channel_<channel_id>` | **Same folder and same line in `chats.md`**. `msg_id` is global within the channel. |
+| **Supergroup / Forum (`Megagroup`)** | `supergroup_<channel_id>` | **Same folder and same line in `chats.md`**. `msg_id` is global within the supergroup. |
+| **Legacy Basic Group (`Chat`)** | `group_<chat_id>` | **Same folder and same line in `chats.md`**. `msg_id` is per account; deduplicates by deterministic fingerprint. |
+| **1:1 Private Chat (`User` / `Bot`)** | `dm_<min_id>_<max_id>` | Conversations with third parties stay isolated (`dm_111_333` vs. `dm_222_333`), but a direct conversation between Account A and Account B (`dm_111_222`) shares the same folder without duplication. |
+| **Saved Messages (`Self`)** | `saved_<self_id>` | Isolated per account (`saved_111` and `saved_222`). |
 
-## 2. Como Evitamos Re-Download de Mensagens
+## 2. How We Avoid Re-Downloading Messages
 
-### Canais e Supergrupos (`chat_synced_ranges`)
-No protocolo MTProto, canais e supergrupos possuem uma numeração sequencial única de mensagens (`1, 2, 3, ...`) compartilhada entre todos os participantes:
-1. Quando a **Conta A** sincroniza o intervalo `[1, 5400]`, o `checkpoint.db` grava `(chat_key='supergroup_9876543210', start_id=1, end_id=5400)` em `chat_synced_ranges`.
-2. Quando a **Conta B** passa pelo mesmo grupo em seguida, ela consulta o maior `msg_id` atual do servidor (ex.: `5405`) e calcula `missing_ranges([1, 5405], synced=[[1, 5400]]) -> [[5401, 5405]]`.
-3. A Conta B baixa **apenas** as 5 mensagens novas (`5401..5405`) — ou eventuais faixas mais antigas caso a Conta B seja membro mais antigo e enxergue histórico anterior ao da Conta A.
+### Channels and Supergroups (`chat_synced_ranges`)
+In the MTProto protocol, channels and supergroups have a single sequential message numbering (`1, 2, 3, ...`) shared among all participants:
+1. When **Account A** syncs the range `[1, 5400]`, `checkpoint.db` records `(chat_key='supergroup_9876543210', start_id=1, end_id=5400)` in `chat_synced_ranges`.
+2. When **Account B** goes through the same group afterwards, it queries the server's current highest `msg_id` (e.g. `5405`) and computes `missing_ranges([1, 5405], synced=[[1, 5400]]) -> [[5401, 5405]]`.
+3. Account B downloads **only** the 5 new messages (`5401..5405`) — or any older ranges if Account B is an older member and can see history earlier than Account A's.
 
-### Grupos Básicos Legados e Conversas Diretas entre Contas Locais
-Em grupos básicos legados (`PeerChat`) e DMs entre duas contas locais, cada conta tem seu próprio contador `msg_id` na caixa de entrada pessoal. Nesses casos:
-- Cada mensagem recebe uma `canonical_key` baseada em fingerprint determinístico:
-  `fp:<sha256(sender_id | timestamp_iso | media_global_key | text)>`
-- Se a Conta B encontrar uma mensagem cujo `canonical_key` já existe em `message_locator`, ela apenas acrescenta seu ID em `"account_msg_ids"` e `"seen_by_accounts"` sem duplicar a mensagem nem re-baixar os anexos.
+### Legacy Basic Groups and Direct Conversations between Local Accounts
+In legacy basic groups (`PeerChat`) and DMs between two local accounts, each account has its own `msg_id` counter in its personal inbox. In these cases:
+- Each message gets a `canonical_key` based on a deterministic fingerprint:
+  `fp:<sha256(sender_id | timestamp_iso | media:<tg_id>)>` for messages with media, otherwise `fp:<sha256(sender_id | timestamp_iso | grp:<grouped_id> | txt:<first 128 chars>)>`.
+  Messages with neither text nor media (service events such as "X added Y", polls, dice, contacts, locations) also mix in a `|tag:<…>` built from stable fields every account sees the same way (action type, user ids, poll/call id, dice value…), so two such events from the same sender in the same second are no longer merged into one. Keys of ordinary messages never changed. Identical texts from the same sender in the same second still share a key — there is no account-independent way to tell them apart.
+- Re-processing a message an account already archived resolves its key through `account_message_map` (account id + message id) first, so keys never drift for messages already in the archive.
+- If Account B finds a message whose `canonical_key` already exists in `message_locator`, it just adds its ID to `"account_msg_ids"` and `"seen_by_accounts"` without duplicating the message or re-downloading the attachments.
 
-## 3. Como Evitamos Re-Download de Fotos, Vídeos, Áudios e Arquivos
+## 3. How We Avoid Re-Downloading Photos, Videos, Audio and Files
 
-No MTProto, os identificadores `photo.id` e `document.id` são **idênticos globalmente** entre diferentes contas do Telegram (apenas o `access_hash` muda por sessão):
+In MTProto, the `photo.id` and `document.id` identifiers are **globally identical** across different Telegram accounts (only the `access_hash` changes per session):
 
-1. **Mesmo chat**: antes de chamar `download_media`, o `media_manager` consulta `media_index` por `(tg_type, tg_id)`. Se o arquivo já está na pasta `photos/`, `videos/`, `audio/` ou `files/` daquele chat, retorna o caminho existente imediatamente (**0 bytes de rede**).
-2. **Encaminhado entre chats diferentes**: se o `(tg_type, tg_id)` já foi baixado anteriormente na pasta de **outro** chat dentro de `data/`, o `media_manager` cria um **hardlink local (`os.link`)** apontando para o mesmo inode (com fallback para cópia local caso esteja em outro filesystem). Assim, cada pasta de chat continua completa e autônoma, sem gastar banda do Telegram nem duplicar espaço em disco.
+1. **Same chat**: before calling `download_media`, `media_manager` looks up `media_index` by `(tg_type, tg_id)`. If the file is already in that chat's `photos/`, `videos/`, `audio/` or `files/` folder, it returns the existing path immediately (**0 bytes of network traffic**).
+2. **Forwarded between different chats**: if the `(tg_type, tg_id)` was already downloaded into **another** chat's folder inside `data/`, `media_manager` creates a **local hardlink (`os.link`)** pointing to the same inode (with fallback to a local copy — written to a temporary file and renamed into place — if it is on another filesystem). An indexed file is only reused if it still has exactly the indexed size; otherwise it is downloaded again. That way, every chat folder stays complete and self-contained, without spending Telegram bandwidth or duplicating disk space.

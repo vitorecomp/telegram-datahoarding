@@ -19,6 +19,7 @@ from tests.conftest import (
     FakePhoto,
     FakeTelegramClient,
     FakeUser,
+    chat_paths_for,
 )
 from tghoard.cli import app
 from tghoard.config import AppConfig
@@ -126,21 +127,22 @@ async def test_multi_account_shared_supergroup_and_legacy_group_zero_redownload(
         db=db,
     )
 
-    # Account 1 downloaded photos 7001 and 7002; Account 2 MUST do ZERO media downloads!
-    assert client1.download_calls == [7001, 7002]
-    assert client2.download_calls == []
-    assert stats.messages_saved == 4  # sg(1,2) + legacy(1) from acc1, plus sg(3) from acc2!
+    # Accounts sync in parallel: whichever account reaches a shared chat first downloads its
+    # photo; the other MUST reuse it. Each media is fetched from the network exactly once.
+    assert sorted(client1.download_calls + client2.download_calls) == [7001, 7002]
+    assert stats.messages_saved == 4  # sg(1,2,3) + legacy(1), no duplicates across accounts!
 
     # Verify Supergroup JSON has messages [1, 2, 3] without duplicates
-    sg_dir = data_dir / "supergroup_8888__grupo-comum"
-    sg_json = json.loads((sg_dir / "chats" / "2026-11-09-pt000.json").read_text(encoding="utf-8"))
+    sg = chat_paths_for(data_dir, "supergroup_8888")
+    assert sg.folder == "grupo-comum-8888"
+    sg_json = json.loads((sg.messages_dir / "2026-11-pt000.json").read_text(encoding="utf-8"))
     assert [m["id"] for m in sg_json["messages"]] == [1, 2, 3]
-    info_md = (sg_dir / "metadata" / "info.md").read_text(encoding="utf-8")
+    info_md = sg.meta("info.md").read_text(encoding="utf-8")
     assert "conta1" in info_md and "conta2" in info_md
 
     # Verify Legacy Group JSON has ONLY 1 message with both account_msg_ids mapped!
-    leg_dir = data_dir / "group_4444__grupo-legado"
-    leg_json = json.loads((leg_dir / "chats" / "2026-11-09-pt000.json").read_text(encoding="utf-8"))
+    leg = chat_paths_for(data_dir, "group_4444")
+    leg_json = json.loads((leg.messages_dir / "2026-11-pt000.json").read_text(encoding="utf-8"))
     assert len(leg_json["messages"]) == 1
     assert leg_json["messages"][0]["account_msg_ids"] == {"111": 801, "222": 19}
     assert leg_json["messages"][0]["seen_by_accounts"] == ["111", "222"]
@@ -180,13 +182,16 @@ async def test_sqlite_checkpoint_resumes_after_mid_sync_crash(tmp_path: Path) ->
         messages_by_entity_id={9999: all_230_msgs},
         fail_after_iter_count=150,
     )
-    with pytest.raises(RuntimeError, match="Simulated mid-sync interruption"):
-        await run_multi_account_sync(
-            account_clients=[(acc, crashing_client)],
-            selections=selections,
-            config=cfg,
-            db=db,
-        )
+    # A non-RPC error skips only that chat (recorded); the run itself still completes
+    stats1 = await run_multi_account_sync(
+        account_clients=[(acc, crashing_client)],
+        selections=selections,
+        config=cfg,
+        db=db,
+    )
+    assert [(k, r) for _, k, r in stats1.failed_chats] == [
+        ("channel_9999", "RuntimeError: Simulated mid-sync interruption")
+    ]
 
     # First batch (1..100) MUST already be safely checkpointed in SQLite and on disk!
     assert db.get_synced_ranges("channel_9999") == [(1, 100)]
@@ -317,15 +322,15 @@ async def test_offline_pts_diff_marks_deleted_and_versions_edits_plus_cli_search
 
     res_del = runner.invoke(app, ["search", "confidencial", "--deleted", "-d", str(data_dir)])
     assert res_del.exit_code == 0
-    assert "APAGADA" in res_del.stdout
+    assert "DELETED" in res_del.stdout
 
     res_ed = runner.invoke(app, ["search", "original v1", "--edited", "-d", str(data_dir)])
     assert res_ed.exit_code == 0
-    assert "EDITADA(1)" in res_ed.stdout
+    assert "EDITED(1)" in res_ed.stdout
 
     res_stats = runner.invoke(app, ["stats", "-d", str(data_dir)])
     assert res_stats.exit_code == 0
-    assert "Mensagens apagadas preservadas" in res_stats.stdout
+    assert "Preserved deleted messages" in res_stats.stdout
 
     res_acc = runner.invoke(app, ["account", "list", "-d", str(data_dir)])
     assert res_acc.exit_code == 0

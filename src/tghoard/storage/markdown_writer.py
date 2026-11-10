@@ -1,4 +1,7 @@
-"""Deterministic plain-text Markdown writers for `links.md` and `metadata/*.md`."""
+"""Deterministic plain-text Markdown writers for `links/<folder>.md` and `metadata/<folder>/*.md`.
+
+The generated text is archive content (users' existing files), so it stays in Portuguese.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from tghoard.storage.atomic import atomic_write_text, utc_now_iso
-from tghoard.storage.paths import iter_all_part_files
+from tghoard.storage.paths import ChatPaths, iter_all_part_files, single_line
 
 URL_REGEX = re.compile(r"https?://[^\s<>()\[\]\"']+")
 
@@ -58,13 +61,14 @@ def extract_links_from_text_and_entities(
 
 
 def ensure_initial_metadata_files(
-    chat_dir: Path,
+    chat_paths: ChatPaths,
     *,
     chat_key: str,
     chat_title: str,
 ) -> None:
     """Create baseline `metadata/*.md` files if not yet present."""
-    meta_dir = chat_dir / "metadata"
+    chat_title = single_line(chat_title)
+    meta_dir = chat_paths.metadata_dir
     meta_dir.mkdir(parents=True, exist_ok=True)
     defaults: dict[str, str] = {
         "info.md": f"# Informações — {chat_title} (`{chat_key}`)\n\n_Sincronização pendente._\n",
@@ -95,33 +99,37 @@ def ensure_initial_metadata_files(
 
 
 def rebuild_links_and_audit_md_from_parts(
-    chat_dir: Path,
+    chat_paths: ChatPaths,
     *,
     chat_key: str,
     chat_title: str,
 ) -> tuple[int, int, int]:
-    """Scan `chats/*-pt*.json` to deterministically write `links.md` and `deleted_and_edits.md`.
+    """Scan `messages/<folder>/*-pt*.json` to write `links/<folder>.md` and `deleted_and_edits.md`.
 
     Returns `(total_links, deleted_count, edited_count)`.
     """
+    chat_title = single_line(chat_title)
     links_by_day: dict[str, list[LinkEntry]] = {}
     seen_link_keys: set[tuple[str, str]] = set()
-    deleted_items: list[dict[str, Any]] = []
-    edited_items: list[dict[str, Any]] = []
+    # An interrupted repack can briefly leave a message in two parts (until the month's next
+    # write merges them): list each message once, keeping its most complete copy.
+    audited: dict[str, dict[str, Any]] = {}
 
-    for part_path in iter_all_part_files(chat_dir):
+    for part_path in iter_all_part_files(chat_paths):
         payload = json.loads(part_path.read_text(encoding="utf-8"))
-        day_str = str(payload.get("date") or part_path.name[:10])
+        month = str(payload.get("month") or part_path.name[:7])
         for msg in payload.get("messages") or []:
             ckey = str(msg.get("canonical_key") or msg.get("id"))
             msg_id = msg.get("id", "?")
             date_iso = str(msg.get("date") or "")
+            # links stay grouped by day (month files hold many days)
+            day_str = date_iso[:10] if len(date_iso) >= 10 else month
             time_str = date_iso[11:19] if len(date_iso) >= 19 else date_iso
             sender = msg.get("sender") or {}
-            sender_name = str(sender.get("name") or sender.get("id") or "Desconhecido")
+            sender_name = single_line(sender.get("name") or sender.get("id") or "Desconhecido")
             sender_user = sender.get("username")
             text = str(msg.get("text") or "")
-            snippet = " ".join(text.splitlines()).strip()
+            snippet = single_line(text)
             if len(snippet) > 160:
                 snippet = snippet[:157] + "..."
 
@@ -143,10 +151,12 @@ def rebuild_links_and_audit_md_from_parts(
                     )
                 )
 
-            if msg.get("is_deleted"):
-                deleted_items.append(msg)
-            if msg.get("revisions"):
-                edited_items.append(msg)
+            prev = audited.get(ckey)
+            if prev is None or _completeness(msg) > _completeness(prev):
+                audited[ckey] = msg
+
+    deleted_items = [m for m in audited.values() if m.get("is_deleted")]
+    edited_items = [m for m in audited.values() if m.get("revisions")]
 
     # Write links.md
     total_links = sum(len(v) for v in links_by_day.values())
@@ -172,7 +182,8 @@ def rebuild_links_and_audit_md_from_parts(
                 if item.snippet and item.snippet != item.url:
                     lines.append(f"  > {item.snippet}")
             lines.append("")
-    atomic_write_text(chat_dir / "links.md", "\n".join(lines).rstrip() + "\n")
+    chat_paths.links_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(chat_paths.links_path, "\n".join(lines).rstrip() + "\n")
 
     # Write metadata/deleted_and_edits.md
     audit_lines = [
@@ -190,8 +201,8 @@ def rebuild_links_and_audit_md_from_parts(
     else:
         for msg in deleted_items:
             sender = msg.get("sender") or {}
-            sname = sender.get("name") or sender.get("id") or "Desconhecido"
-            txt = (msg.get("text") or "").replace("\n", " ") or "_[sem texto / apenas mídia]_"
+            sname = single_line(sender.get("name") or sender.get("id") or "Desconhecido")
+            txt = single_line(msg.get("text") or "") or "_[sem texto / apenas mídia]_"
             media_note = ""
             if msg.get("media"):
                 mpath = msg["media"].get("path") or msg["media"].get("category")
@@ -208,21 +219,21 @@ def rebuild_links_and_audit_md_from_parts(
     else:
         for msg in edited_items:
             sender = msg.get("sender") or {}
-            sname = sender.get("name") or sender.get("id") or "Desconhecido"
+            sname = single_line(sender.get("name") or sender.get("id") or "Desconhecido")
             audit_lines.append(f"### `msg #{msg.get('id')}` ({msg.get('date')}) — **{sname}**")
             for rev in msg.get("revisions") or []:
-                rev_txt = (rev.get("text") or "").replace("\n", " ")
+                rev_txt = single_line(rev.get("text") or "")
                 audit_lines.append(
                     f"- **Versão #{rev.get('revision')}** "
                     f"(capturada em `{rev.get('captured_at')}`): {rev_txt}"
                 )
-            cur_txt = (msg.get("text") or "").replace("\n", " ")
+            cur_txt = single_line(msg.get("text") or "")
             audit_lines.append(
                 f"- **Versão atual** (editada em `{msg.get('edit_date')}`): {cur_txt}"
             )
             audit_lines.append("")
 
-    meta_dir = chat_dir / "metadata"
+    meta_dir = chat_paths.metadata_dir
     meta_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(
         meta_dir / "deleted_and_edits.md",
@@ -231,8 +242,12 @@ def rebuild_links_and_audit_md_from_parts(
     return total_links, len(deleted_items), len(edited_items)
 
 
+def _completeness(msg: dict[str, Any]) -> tuple[bool, int]:
+    return bool(msg.get("is_deleted")), len(msg.get("revisions") or [])
+
+
 def write_info_md(
-    chat_dir: Path,
+    chat_paths: ChatPaths,
     *,
     chat_key: str,
     chat_title: str,
@@ -247,6 +262,8 @@ def write_info_md(
     synced_ranges: Sequence[tuple[int, int]],
     stats: dict[str, int] | None = None,
 ) -> None:
+    # Line 1 is the folder's identity (`(`chat_key`)` at the end): keep it on one line
+    chat_title = single_line(chat_title)
     lines = [
         f"# Informações — {chat_title} (`{chat_key}`)",
         "",
@@ -277,12 +294,12 @@ def write_info_md(
                 "",
                 "## Estatísticas Locais",
                 "",
-                f"- **Partes JSON (`chats/*-pt*.json`)**: {stats.get('parts', 0)}",
+                f"- **Partes JSON (`messages/<pasta>/*-pt*.json`)**: {stats.get('parts', 0)}",
                 f"- **Fotos em `photos/`**: {stats.get('photos', 0)}",
                 f"- **Vídeos em `videos/`**: {stats.get('videos', 0)}",
                 f"- **Áudios em `audio/`**: {stats.get('audio', 0)}",
                 f"- **Arquivos em `files/`**: {stats.get('files', 0)}",
-                f"- **Links em `links.md`**: {stats.get('links', 0)}",
+                f"- **Links em `links/<pasta>.md`**: {stats.get('links', 0)}",
             ]
         )
 
@@ -290,26 +307,30 @@ def write_info_md(
     if not accounts_info:
         lines.append("_Nenhuma conta registrada._")
     else:
-        lines.append("| Account ID | Alias | Username | Última Atualização |")
-        lines.append("| :--- | :--- | :--- | :--- |")
+        lines.append("| Account ID | Alias | Username | Entrou em | Última Atualização |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- |")
         for acc in accounts_info:
             uname = f"@{acc['username']}" if acc.get("username") else "-"
+            joined = f"`{acc['joined_at']}`" if acc.get("joined_at") else "-"
+            if acc.get("inviter_id"):
+                joined += f" (convidado por `{acc['inviter_id']}`)"
             lines.append(
                 f"| `{acc['account_id']}` | `{acc.get('alias', '-')}` | "
-                f"`{uname}` | `{acc.get('updated_at', '-')}` |"
+                f"`{uname}` | {joined} | `{acc.get('updated_at', '-')}` |"
             )
 
-    atomic_write_text(chat_dir / "metadata" / "info.md", "\n".join(lines).rstrip() + "\n")
+    atomic_write_text(chat_paths.metadata_dir / "info.md", "\n".join(lines).rstrip() + "\n")
 
 
 def write_members_md(
-    chat_dir: Path,
+    chat_paths: ChatPaths,
     *,
     chat_key: str,
     chat_title: str,
     members: Sequence[dict[str, Any]],
     note: str | None = None,
 ) -> None:
+    chat_title = single_line(chat_title)
     lines = [
         f"# Membros — {chat_title} (`{chat_key}`)",
         "",
@@ -326,21 +347,22 @@ def write_members_md(
         lines.append("| :--- | :--- | :--- | :--- | :---: |")
         for m in members:
             uname = f"`@{m['username']}`" if m.get("username") else "-"
-            name = str(m.get("name") or "-").replace("|", "\\|")
+            name = single_line(m.get("name") or "-").replace("|", "\\|")
             role = str(m.get("role") or "member")
             is_bot = "Sim" if m.get("is_bot") else "Não"
             lines.append(f"| `{m['id']}` | {name} | {uname} | `{role}` | {is_bot} |")
 
-    atomic_write_text(chat_dir / "metadata" / "members.md", "\n".join(lines).rstrip() + "\n")
+    atomic_write_text(chat_paths.metadata_dir / "members.md", "\n".join(lines).rstrip() + "\n")
 
 
 def write_topics_md(
-    chat_dir: Path,
+    chat_paths: ChatPaths,
     *,
     chat_key: str,
     chat_title: str,
     topics: Sequence[dict[str, Any]],
 ) -> None:
+    chat_title = single_line(chat_title)
     lines = [
         f"# Tópicos — {chat_title} (`{chat_key}`)",
         "",
@@ -354,12 +376,12 @@ def write_topics_md(
         lines.append("| Topic ID | Título | Status | Fixado |")
         lines.append("| :--- | :--- | :--- | :---: |")
         for t in topics:
-            title = str(t.get("title") or "-").replace("|", "\\|")
+            title = single_line(t.get("title") or "-").replace("|", "\\|")
             status = "Fechado" if t.get("closed") else "Aberto"
             pinned = "Sim" if t.get("pinned") else "Não"
             lines.append(f"| `{t['id']}` | {title} | {status} | {pinned} |")
 
-    atomic_write_text(chat_dir / "metadata" / "topics.md", "\n".join(lines).rstrip() + "\n")
+    atomic_write_text(chat_paths.metadata_dir / "topics.md", "\n".join(lines).rstrip() + "\n")
 
 
 def append_markdown_log_entries(
@@ -368,25 +390,25 @@ def append_markdown_log_entries(
     header_title: str,
     entries: Sequence[str],
 ) -> int:
-    """Append unique Markdown bullet lines to a log `.md` file."""
+    """Append unique Markdown bullet lines to a log `.md` file.
+
+    These logs are the only copy of the history (profile changes, stories, presence, admin
+    log): existing lines are never dropped. Each entry is forced onto a single line, since
+    entries embed Telegram-sourced text (bios, captions) and dedup is line-based.
+    """
+    entries = [_one_line_entry(e) for e in entries if e and e.strip()]
     if not entries:
         return 0
 
     existing_text = ""
     if md_path.exists():
         existing_text = md_path.read_text(encoding="utf-8")
+    existing_lines = existing_text.rstrip().split("\n") if existing_text.strip() else []
 
-    # Strip placeholder italics lines on first real write
-    placeholder_markers = (
-        "_Nenhum story capturado._",
-        "_Nenhuma alteração de perfil detectada ainda._",
-        "_Nenhum evento de presença registrado._",
-        "_Nenhum evento de serviço ou Admin Log registrado._",
-    )
-    if not existing_text or any(m in existing_text for m in placeholder_markers):
-        existing_lines = [f"# {header_title}", ""]
-    else:
-        existing_lines = existing_text.rstrip().splitlines()
+    # Replace the file only while it is still exactly the initial placeholder
+    body = [ln.strip() for ln in existing_lines[1:] if ln.strip()]
+    if not existing_lines or (len(body) == 1 and body[0] in _LOG_PLACEHOLDERS):
+        existing_lines = [f"# {single_line(header_title)}", ""]
 
     existing_set = set(existing_lines)
     added = 0
@@ -399,3 +421,19 @@ def append_markdown_log_entries(
     if added > 0 or not md_path.exists():
         atomic_write_text(md_path, "\n".join(existing_lines).rstrip() + "\n")
     return added
+
+
+_LOG_PLACEHOLDERS = frozenset(
+    {
+        "_Nenhum story capturado._",
+        "_Nenhuma alteração de perfil detectada ainda._",
+        "_Nenhum evento de presença registrado._",
+        "_Nenhum evento de serviço ou Admin Log registrado._",
+    }
+)
+
+
+def _one_line_entry(entry: str) -> str:
+    """Keep the entry's leading indentation/bullet, collapse any embedded line break."""
+    stripped = entry.lstrip(" ")
+    return entry[: len(entry) - len(stripped)] + single_line(stripped)

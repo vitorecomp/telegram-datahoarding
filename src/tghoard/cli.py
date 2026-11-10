@@ -3,21 +3,39 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import sys
+import threading
+import webbrowser
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
-from tghoard.config import ALL_MEDIA_CATEGORIES, SyncMode, load_config
+from tghoard.config import ALL_MEDIA_CATEGORIES, AppConfig, SyncMode, load_config
+from tghoard.migrations import (
+    discover_migrations,
+    load_applied,
+    pending_migrations,
+    record_applied,
+)
+from tghoard.storage.atomic import atomic_write_text
 from tghoard.storage.chats_manifest import load_chats_manifest
 from tghoard.storage.checkpoint_db import AccountRecord, CheckpointDB
-from tghoard.storage.paths import iter_all_part_files
+from tghoard.storage.paths import iter_all_part_files, single_line
+from tghoard.storage.process_lock import ArchiveLockedError, archive_lock
 from tghoard.sync.discovery import run_discovery_and_write_manifest
-from tghoard.sync.orchestrator import run_multi_account_sync
+from tghoard.sync.live_state import LiveSyncState, wait_for_user
+from tghoard.sync.orchestrator import (
+    ArchiveStorageError,
+    filter_enabled,
+    run_multi_account_sync,
+)
 from tghoard.sync.rebuilder import (
     iter_archive_chat_dirs,
     rebuild_checkpoint_from_plaintext,
@@ -25,15 +43,18 @@ from tghoard.sync.rebuilder import (
 )
 from tghoard.sync.watcher import run_live_watcher
 from tghoard.telegram.accounts import AccountManager
+from tghoard.telegram.entities import classify_entity_to_chat_info
+from tghoard.web.server import WebUI
+from tghoard.web.telegram_bridge import TelegramBridge
 
 app = typer.Typer(
     name="tghoard",
-    help="Arquivador plain-text multi-conta do Telegram com checkpoints SQLite.",
+    help="Multi-account plain-text Telegram archiver with SQLite checkpoints.",
     no_args_is_help=True,
 )
 account_app = typer.Typer(
     name="account",
-    help="Gerenciar contas autenticadas do Telegram.",
+    help="Manage authenticated Telegram accounts.",
     no_args_is_help=True,
 )
 app.add_typer(account_app, name="account")
@@ -45,7 +66,7 @@ DataDirOption = Annotated[
     typer.Option(
         "--data-dir",
         "-d",
-        help="Diretório de saída dos itens (padrão: TGHOARD_DATA_DIR ou ./data).",
+        help="Output directory for the archive (default: TGHOARD_DATA_DIR or ./data).",
     ),
 ]
 
@@ -56,17 +77,52 @@ def _resolve_runtime_config(
     max_json_kb: int | None = None,
     max_media_mb: int | None = None,
     concurrency: int | None = None,
+    parallel_chats: int | None = None,
     sync_mode: SyncMode | None = None,
+    history_wait: float | None = None,
+    auto_throttle: bool | None = None,
+    metadata_every_hours: float | None = None,
 ):
     cfg = load_config(".env").with_overrides(
         data_dir=data_dir,
         max_json_kb=max_json_kb,
         max_media_mb=max_media_mb,
         concurrency=concurrency,
+        parallel_chats=parallel_chats,
         sync_mode=sync_mode,
+        history_wait=history_wait,
+        auto_throttle=auto_throttle,
+        metadata_every_hours=metadata_every_hours,
     )
     cfg.ensure_dirs()
     return cfg
+
+
+@contextlib.contextmanager
+def _writer_lock(cfg: AppConfig, command: str):
+    """Only one process may write to an archive at a time (see storage/process_lock.py)."""
+    try:
+        with archive_lock(cfg.internal_dir, command):
+            yield
+    except ArchiveLockedError as exc:
+        console.print(f"[red]✗ {escape(str(exc))}[/red]")
+        console.print("Stop the other tghoard process (or wait for it to finish) and try again.")
+        raise typer.Exit(code=3) from None
+
+
+def _require_current_layout(cfg: AppConfig) -> None:
+    """Refuse to touch an archive that still needs `tghoard migrate` (avoids mixed layouts)."""
+    pending = pending_migrations(cfg, required_only=True)
+    if not pending:
+        return
+    console.print(f"[red]The archive at `{cfg.data_dir}` must be migrated before continuing:[/red]")
+    for mig in pending:
+        console.print(f"  • [bold]{mig.key}[/bold]: {mig.description}")
+    console.print(
+        "See the plan with [bold]tghoard migrate[/bold] and apply it with "
+        "[bold]tghoard migrate --apply[/bold]."
+    )
+    raise typer.Exit(code=2)
 
 
 def _select_accounts(
@@ -76,7 +132,7 @@ def _select_accounts(
     if account_filter:
         rec = db.get_account(account_filter)
         if rec is None:
-            raise typer.BadParameter(f"Conta `{account_filter}` não encontrada.")
+            raise typer.BadParameter(f"Account `{account_filter}` not found.")
         return [rec]
     return db.list_accounts()
 
@@ -91,19 +147,19 @@ def cmd_start(
         bool,
         typer.Option(
             "--add-account",
-            help="Autenticar uma nova conta Telegram antes de atualizar o chats.md.",
+            help="Authenticate a new Telegram account before updating chats.md.",
         ),
     ] = False,
     alias: Annotated[
         str | None,
-        typer.Option("--alias", help="Apelido para a nova conta autenticada."),
+        typer.Option("--alias", help="Alias for the newly authenticated account."),
     ] = None,
     chats_file: Annotated[
         Path | None,
-        typer.Option("--chats-file", help="Caminho alternativo para o arquivo chats.md."),
+        typer.Option("--chats-file", help="Alternative path to the chats.md file."),
     ] = None,
 ) -> None:
-    """Autentica conta(s) e cria/atualiza `<data_dir>/chats.md` com os checkboxes padrão."""
+    """Authenticate account(s) and create/update `<data_dir>/chats.md` with default checkboxes."""
     cfg = _resolve_runtime_config(data_dir=data_dir)
     manifest_path = chats_file or cfg.chats_manifest_path
 
@@ -126,20 +182,22 @@ def cmd_start(
                     account_clients=connected,
                     manifest_path=manifest_path,
                     console=console,
+                    data_dir=cfg.data_dir,
                 )
             finally:
                 for _, client in connected:
                     await client.disconnect()  # type: ignore[attr-defined]
 
             console.print(
-                f"\n[bold green]✓ Manifesto atualizado em:[/bold green] `{summary.manifest_path}`\n"
-                f"  • Total de chats listados: [bold]{summary.total_chats}[/bold] "
-                f"(novos: {summary.added_chats}, preservados: {summary.updated_chats})\n"
-                f"  • Próximo passo: edite os checkboxes em `{summary.manifest_path}` e execute "
+                f"\n[bold green]✓ Manifest updated at:[/bold green] `{summary.manifest_path}`\n"
+                f"  • Chats listed: [bold]{summary.total_chats}[/bold] "
+                f"(new: {summary.added_chats}, kept: {summary.updated_chats})\n"
+                f"  • Next step: edit the checkboxes in `{summary.manifest_path}` and run "
                 "`tghoard sync`."
             )
 
-    asyncio.run(_run())
+    with _writer_lock(cfg, "start"):
+        asyncio.run(_run())
 
 
 # ----------------------------------------------------------------------
@@ -150,81 +208,202 @@ def cmd_sync(
     data_dir: DataDirOption = None,
     account: Annotated[
         str | None,
-        typer.Option(
-            "--account", "-a", help="Sincronizar apenas uma conta específica (alias ou ID)."
-        ),
+        typer.Option("--account", "-a", help="Sync only one specific account (alias or ID)."),
     ] = None,
     chat: Annotated[
         str | None,
-        typer.Option(
-            "--chat", "-c", help="Sincronizar apenas um chat específico (`chat_key` ou título)."
-        ),
+        typer.Option("--chat", "-c", help="Sync only one specific chat (`chat_key` or title)."),
     ] = None,
     mode: Annotated[
         SyncMode | None,
-        typer.Option("--mode", help="Modo de sessão: auto | takeout | standard."),
+        typer.Option("--mode", help="Session mode: auto | takeout | standard."),
     ] = None,
     max_json_kb: Annotated[
         int | None,
-        typer.Option("--max-json-kb", help="Tamanho máximo (KB) por parte YYYY-MM-DD-ptNNN.json."),
+        typer.Option("--max-json-kb", help="Max size (KB) per YYYY-MM-ptNNN.json part."),
     ] = None,
     max_media_mb: Annotated[
         int | None,
-        typer.Option("--max-media-mb", help="Tamanho máximo por anexo em MB (0 = sem limite)."),
+        typer.Option("--max-media-mb", help="Max size per attachment in MB (0 = no limit)."),
     ] = None,
     concurrency: Annotated[
         int | None,
-        typer.Option("--concurrency", help="Concorrência máxima de chamadas/downloads."),
+        typer.Option("--concurrency", help="Max concurrency of calls/downloads."),
     ] = None,
+    parallel_chats: Annotated[
+        int | None,
+        typer.Option(
+            "--parallel-chats",
+            "-j",
+            min=1,
+            max=16,
+            help="How many chats to sync simultaneously per account (default 4).",
+        ),
+    ] = None,
+    history_wait: Annotated[
+        float | None,
+        typer.Option(
+            "--history-wait",
+            min=0,
+            max=10,
+            help="Pause (s) between pages of 100 messages (default 0; Telethon would use 1s). "
+            "Increase it if you get many FloodWaits.",
+        ),
+    ] = None,
+    refresh_metadata: Annotated[
+        bool,
+        typer.Option(
+            "--refresh-metadata",
+            help="Refresh the metadata of all chats now (ignores TGHOARD_METADATA_EVERY_HOURS).",
+        ),
+    ] = False,
+    no_auto_throttle: Annotated[
+        bool,
+        typer.Option(
+            "--no-auto-throttle",
+            help="Disable automatic tuning (pause/parallelism) based on FloodWaits.",
+        ),
+    ] = False,
     since: Annotated[
         str | None,
-        typer.Option("--since", help="Data mínima YYYY-MM-DD para mensagens históricas."),
+        typer.Option("--since", help="Earliest date (YYYY-MM-DD) for historical messages."),
     ] = None,
     skip_members: Annotated[
         bool,
-        typer.Option("--skip-members", help="Pular sincronização da lista de membros."),
+        typer.Option("--skip-members", help="Skip syncing the member list."),
     ] = False,
     skip_stories: Annotated[
         bool,
-        typer.Option("--skip-stories", help="Pular captura de Stories ativos."),
+        typer.Option("--skip-stories", help="Skip capturing active Stories."),
     ] = False,
     skip_profile_photos: Annotated[
         bool,
-        typer.Option("--skip-profile-photos", help="Pular histórico de fotos de perfil."),
+        typer.Option("--skip-profile-photos", help="Skip profile photo history."),
     ] = False,
     chats_file: Annotated[
         Path | None,
-        typer.Option("--chats-file", help="Caminho alternativo para o arquivo chats.md."),
+        typer.Option("--chats-file", help="Alternative path to the chats.md file."),
     ] = None,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-v",
+            help="Detailed log: every RPC and its duration, reused/deferred media, "
+            "metadata steps and ignored errors.",
+        ),
+    ] = False,
+    no_web: Annotated[
+        bool,
+        typer.Option(
+            "--no-web", help="Do not start the web UI (the CLI works the same without it)."
+        ),
+    ] = False,
+    web_port: Annotated[
+        int | None,
+        typer.Option("--web-port", help="Web UI port (default: TGHOARD_WEB_PORT or 8765)."),
+    ] = None,
+    no_browser: Annotated[
+        bool,
+        typer.Option("--no-browser", help="Do not open the browser automatically."),
+    ] = False,
 ) -> None:
-    """Sincroniza mensagens, links, metadados e mídias conforme `<data_dir>/chats.md`."""
+    """Sync messages, links, metadata and media according to `<data_dir>/chats.md`.
+
+    In an interactive terminal it also opens a local web UI to manage `chats.md`
+    (checkboxes and priorities, even during the sync) and follow the progress. When
+    there is nothing to sync (no chat selected, or the sync finished), it waits for you
+    to press Enter (or click "Start sync" in the web UI) to run again; `q` quits.
+    Outside a terminal (cron, pipe) it runs once and exits.
+    """
     cfg = _resolve_runtime_config(
         data_dir=data_dir,
         max_json_kb=max_json_kb,
         max_media_mb=max_media_mb,
         concurrency=concurrency,
+        parallel_chats=parallel_chats,
         sync_mode=mode,
+        history_wait=history_wait,
+        auto_throttle=False if no_auto_throttle else None,
+        metadata_every_hours=0 if refresh_metadata else None,
     )
+    _require_current_layout(cfg)
     manifest_path = chats_file or cfg.chats_manifest_path
     if not manifest_path.exists():
-        console.print(
-            f"[red]Arquivo `{manifest_path}` não encontrado. "
-            "Execute `tghoard start` primeiro.[/red]"
-        )
+        console.print(f"[red]File `{manifest_path}` not found. Run `tghoard start` first.[/red]")
         raise typer.Exit(code=1)
 
-    selections = load_chats_manifest(manifest_path)
     since_dt: datetime | None = None
     if since:
-        since_dt = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC)
+        try:
+            since_dt = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC)
+        except ValueError:
+            console.print(f"[red]Invalid --since `{escape(since)}`: use YYYY-MM-DD.[/red]")
+            raise typer.Exit(code=2) from None
 
-    async def _run() -> None:
+    interactive = sys.stdin.isatty()
+    live = LiveSyncState()
+    bridge = TelegramBridge(cfg.internal_dir)
+    web: WebUI | None = None
+
+    def _start_web() -> WebUI:
+        ui = WebUI(
+            data_dir=cfg.data_dir,
+            manifest_path=manifest_path,
+            db_path=cfg.checkpoint_db_path,
+            live=live,
+            bridge=bridge,
+            port=web_port if web_port is not None else cfg.web_port,
+        )
+        url = ui.start()
+        console.print(
+            f"🌐 Web UI: [bold][link={url}]{url}[/link][/bold] "
+            "[dim](manages chats.md; use --no-web to disable)[/dim]"
+        )
+        if interactive and not no_browser:
+            threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
+        return ui
+
+    async def _register_entities(connected: list[tuple[AccountRecord, Any]]) -> None:
+        """Let the web UI show chat photos/totals before and while syncing (best effort)."""
+        registered = 0
+        try:
+            for acc, client in connected:
+                try:
+                    me = await client.get_me()
+                    if me is not None:
+                        bridge.register(f"saved_{acc.account_id}", client, me)
+                        registered += 1
+                    async for dialog in client.iter_dialogs():
+                        ent = getattr(dialog, "entity", None)
+                        if ent is not None:
+                            info = classify_entity_to_chat_info(
+                                ent, self_id=acc.account_id, account_alias=acc.alias
+                            )
+                            bridge.register(info.chat_key, client, ent)
+                            registered += 1
+                except Exception as exc:
+                    live.add_log(
+                        f"⚠ web UI: could not list the chats of `{acc.alias}` "
+                        f"for photos/totals: {type(exc).__name__}: {exc}"
+                    )
+        finally:
+            bridge.mark_ready()  # never leave web requests waiting forever
+            live.add_log(f"🖼 web UI: {registered} chat(s) ready for photos and totals")
+
+    async def _run() -> int:
+        """Returns the number of chats that failed in the last sync run."""
+        failed = 0
+        loop = asyncio.get_running_loop()
+        live.attach_loop(loop)
+        bridge.attach_loop(loop)
+        bridge.log = live.add_log
+        live.set_phase("connecting", "Connecting Telegram accounts")
         with CheckpointDB(cfg.checkpoint_db_path) as db:
             accounts = _select_accounts(db, account)
             if not accounts:
                 console.print(
-                    "[red]Nenhuma conta autenticada encontrada. "
-                    "Execute `tghoard start` primeiro.[/red]"
+                    "[red]No authenticated account found. Run `tghoard start` first.[/red]"
                 )
                 raise typer.Exit(code=1)
 
@@ -234,24 +413,84 @@ def cmd_sync(
                 for acc in accounts:
                     client = await mgr.connect_account(acc)
                     connected.append((acc, client))
-
-                await run_multi_account_sync(
-                    account_clients=connected,
-                    selections=selections,
-                    config=cfg,
-                    db=db,
-                    chat_filter=chat,
-                    since_date=since_dt,
-                    sync_members=not skip_members,
-                    sync_stories=not skip_stories,
-                    sync_profile_photos=not skip_profile_photos,
-                    console=console,
+                entities_task = (
+                    asyncio.create_task(_register_entities(connected)) if web is not None else None
                 )
+
+                while True:
+                    selections = load_chats_manifest(manifest_path)
+                    has_job = bool(filter_enabled(selections, chat))
+                    if has_job:
+                        stats = await run_multi_account_sync(
+                            account_clients=connected,
+                            selections=selections,
+                            config=cfg,
+                            db=db,
+                            chat_filter=chat,
+                            since_date=since_dt,
+                            sync_members=not skip_members,
+                            sync_stories=not skip_stories,
+                            sync_profile_photos=not skip_profile_photos,
+                            console=console,
+                            verbose=verbose,
+                            manifest_path=manifest_path,
+                            live=live,
+                            on_entity=bridge.register,
+                        )
+                        failed = len(stats.failed_chats) + len(stats.failed_accounts)
+                    if not interactive:
+                        if not has_job:
+                            console.print(
+                                "[yellow]No chat marked `[x] baixar` matches the filter.[/yellow]"
+                            )
+                        break
+
+                    where = f" in the web UI ({web.url})" if web is not None else ""
+                    if has_job:
+                        live.set_phase("done", "Sync finished — nothing left in the queue")
+                        console.print(
+                            f"\n[green]✓ Nothing left in the queue.[/green] Adjust chats.md{where} "
+                            "and press [bold]Enter[/bold] to sync again "
+                            "([bold]q[/bold] + Enter or Ctrl+C to quit)."
+                        )
+                    else:
+                        live.set_phase("waiting_user", "No chat selected for download")
+                        console.print(
+                            f"\n[yellow]No chat marked `[x] baixar`.[/yellow] "
+                            f"Select chats{where} or edit `{manifest_path}` and press "
+                            "[bold]Enter[/bold] ([bold]q[/bold] + Enter or Ctrl+C to quit)."
+                        )
+                    answer = await wait_for_user(live.start_event)
+                    if answer == "quit":
+                        break
+                    if answer == "web":
+                        console.print("[cyan]▶ Sync requested from the web UI[/cyan]")
+                if entities_task is not None:
+                    entities_task.cancel()
             finally:
                 for _, client in connected:
                     await client.disconnect()  # type: ignore[attr-defined]
+        return failed
 
-    asyncio.run(_run())
+    failed_chats = 0
+    try:
+        # Lock first: a second `sync` must exit before opening a web UI of its own
+        with _writer_lock(cfg, "sync"):
+            if not no_web:
+                web = _start_web()
+            failed_chats = asyncio.run(_run())
+    except KeyboardInterrupt:
+        console.print("\n[dim]Interrupted. Progress already saved stays in the checkpoint.[/dim]")
+        raise typer.Exit(code=130) from None
+    except ArchiveStorageError:
+        # Disk full / read-only / drive gone: the orchestrator already printed why
+        raise typer.Exit(code=1) from None
+    finally:
+        if web is not None:
+            web.stop()
+    if failed_chats:
+        # Cron/scripts can tell a partial run apart (the failed chats resume next sync)
+        raise typer.Exit(code=1)
 
 
 # ----------------------------------------------------------------------
@@ -259,28 +498,28 @@ def cmd_sync(
 # ----------------------------------------------------------------------
 @account_app.command("list")
 def cmd_account_list(data_dir: DataDirOption = None) -> None:
-    """Lista todas as contas Telegram registradas em `<data_dir>`."""
+    """List all Telegram accounts registered in `<data_dir>`."""
     cfg = _resolve_runtime_config(data_dir=data_dir)
     with CheckpointDB(cfg.checkpoint_db_path) as db:
         accounts = db.list_accounts()
 
     if not accounts:
-        console.print("[yellow]Nenhuma conta cadastrada neste diretório.[/yellow]")
+        console.print("[yellow]No accounts registered in this directory.[/yellow]")
         return
 
-    table = Table(title=f"Contas Telegram ({cfg.data_dir})")
+    table = Table(title=f"Telegram accounts ({cfg.data_dir})")
     table.add_column("Account ID", style="cyan")
     table.add_column("Alias", style="bold")
-    table.add_column("Nome")
+    table.add_column("Name")
     table.add_column("Username")
-    table.add_column("Último Sync")
+    table.add_column("Last sync")
     for acc in accounts:
         table.add_row(
             str(acc.account_id),
-            acc.alias,
-            acc.display_name or "-",
-            f"@{acc.username}" if acc.username else "-",
-            acc.last_sync_at or "Nunca",
+            escape(acc.alias),
+            escape(single_line(acc.display_name or "-")),
+            escape(f"@{acc.username}") if acc.username else "-",
+            acc.last_sync_at or "Never",
         )
     console.print(table)
 
@@ -288,9 +527,9 @@ def cmd_account_list(data_dir: DataDirOption = None) -> None:
 @account_app.command("add")
 def cmd_account_add(
     data_dir: DataDirOption = None,
-    alias: Annotated[str | None, typer.Option("--alias", help="Apelido da conta.")] = None,
+    alias: Annotated[str | None, typer.Option("--alias", help="Account alias.")] = None,
 ) -> None:
-    """Autentica e adiciona uma nova conta Telegram ao diretório de dados."""
+    """Authenticate and add a new Telegram account to the data directory."""
     cfg = _resolve_runtime_config(data_dir=data_dir)
 
     async def _run() -> None:
@@ -298,26 +537,28 @@ def cmd_account_add(
             mgr = AccountManager(cfg, db, console=console)
             await mgr.interactive_add_account(alias=alias)
 
-    asyncio.run(_run())
+    with _writer_lock(cfg, "account add"):
+        asyncio.run(_run())
 
 
 @account_app.command("remove")
 def cmd_account_remove(
-    identifier: Annotated[str, typer.Argument(help="Alias, username ou ID numérico da conta.")],
+    identifier: Annotated[str, typer.Argument(help="Account alias, username or numeric ID.")],
     data_dir: DataDirOption = None,
 ) -> None:
-    """Remove a sessão de uma conta mantendo todos os dados plain-text já baixados."""
+    """Remove an account's session, keeping all plain-text data already downloaded."""
     cfg = _resolve_runtime_config(data_dir=data_dir)
-    with CheckpointDB(cfg.checkpoint_db_path) as db:
+    # A running sync/watch keeps the session open: never delete it underneath them
+    with _writer_lock(cfg, "account remove"), CheckpointDB(cfg.checkpoint_db_path) as db:
         mgr = AccountManager(cfg, db, console=console)
         removed = mgr.remove_account(identifier)
 
     if removed is None:
-        console.print(f"[red]Conta `{identifier}` não encontrada.[/red]")
+        console.print(f"[red]Account `{identifier}` not found.[/red]")
         raise typer.Exit(code=1)
     console.print(
-        f"[green]✓ Sessão da conta `{removed.alias}` ({removed.account_id}) removida. "
-        "Dados arquivados permanecem intactos.[/green]"
+        f"[green]✓ Session of account `{escape(removed.alias)}` ({removed.account_id}) removed. "
+        "Archived data is left intact.[/green]"
     )
 
 
@@ -329,20 +570,19 @@ def cmd_watch(
     data_dir: DataDirOption = None,
     account: Annotated[
         str | None,
-        typer.Option("--account", "-a", help="Escutar apenas uma conta específica."),
+        typer.Option("--account", "-a", help="Listen on one specific account only."),
     ] = None,
     chats_file: Annotated[
         Path | None,
-        typer.Option("--chats-file", help="Caminho alternativo para o arquivo chats.md."),
+        typer.Option("--chats-file", help="Alternative path to the chats.md file."),
     ] = None,
 ) -> None:
-    """Escuta eventos ao vivo (edições, deleções instantâneas, status online e digitação)."""
+    """Listen to live events (edits, instant deletions, online status and typing)."""
     cfg = _resolve_runtime_config(data_dir=data_dir)
+    _require_current_layout(cfg)
     manifest_path = chats_file or cfg.chats_manifest_path
     if not manifest_path.exists():
-        console.print(
-            f"[red]Arquivo `{manifest_path}` não encontrado. Execute `tghoard start`.[/red]"
-        )
+        console.print(f"[red]File `{manifest_path}` not found. Run `tghoard start`.[/red]")
         raise typer.Exit(code=1)
     selections = load_chats_manifest(manifest_path)
 
@@ -350,7 +590,7 @@ def cmd_watch(
         with CheckpointDB(cfg.checkpoint_db_path) as db:
             accounts = _select_accounts(db, account)
             if not accounts:
-                console.print("[red]Nenhuma conta cadastrada.[/red]")
+                console.print("[red]No accounts registered.[/red]")
                 raise typer.Exit(code=1)
             mgr = AccountManager(cfg, db, console=console)
             connected: list[tuple[AccountRecord, object]] = []
@@ -370,9 +610,10 @@ def cmd_watch(
                     await client.disconnect()  # type: ignore[attr-defined]
 
     try:
-        asyncio.run(_run())
+        with _writer_lock(cfg, "watch"):
+            asyncio.run(_run())
     except KeyboardInterrupt:
-        console.print("\n[yellow]Escuta encerrada pelo usuário.[/yellow]")
+        console.print("\n[yellow]Listening stopped by the user.[/yellow]")
 
 
 # ----------------------------------------------------------------------
@@ -380,27 +621,26 @@ def cmd_watch(
 # ----------------------------------------------------------------------
 @app.command("search")
 def cmd_search(
-    query: Annotated[str, typer.Argument(help="Termo de busca (case-insensitive).")],
+    query: Annotated[str, typer.Argument(help="Search term (case-insensitive).")],
     data_dir: DataDirOption = None,
     chat: Annotated[
-        str | None, typer.Option("--chat", "-c", help="Filtrar por pasta/chat_key.")
+        str | None, typer.Option("--chat", "-c", help="Filter by folder/chat_key.")
     ] = None,
-    deleted: Annotated[bool, typer.Option("--deleted", help="Apenas mensagens apagadas.")] = False,
-    edited: Annotated[bool, typer.Option("--edited", help="Apenas mensagens editadas.")] = False,
-    links: Annotated[
-        bool, typer.Option("--links", help="Buscar também nas URLs extraídas.")
-    ] = False,
-    limit: Annotated[int, typer.Option("--limit", "-n", help="Máximo de resultados.")] = 50,
+    deleted: Annotated[bool, typer.Option("--deleted", help="Only deleted messages.")] = False,
+    edited: Annotated[bool, typer.Option("--edited", help="Only edited messages.")] = False,
+    links: Annotated[bool, typer.Option("--links", help="Also search the extracted URLs.")] = False,
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Max number of results.")] = 50,
 ) -> None:
-    """Pesquisa rápida sobre os arquivos plain-text `chats/*-pt*.json`."""
+    """Quick search over the plain-text files `messages/<chat>/*-ptNNN.json`."""
     cfg = _resolve_runtime_config(data_dir=data_dir)
+    _require_current_layout(cfg)
     q_lower = query.lower()
     matches = 0
 
-    for chat_key, chat_dir in iter_archive_chat_dirs(cfg.data_dir):
-        if chat and chat.lower() not in chat_dir.name.lower():
+    for chat_key, chat_paths in iter_archive_chat_dirs(cfg.data_dir):
+        if chat and chat.lower() not in (chat_key + " " + chat_paths.folder).lower():
             continue
-        for part_file in iter_all_part_files(chat_dir):
+        for part_file in iter_all_part_files(chat_paths):
             payload = json.loads(part_file.read_text(encoding="utf-8"))
             title = payload.get("chat_title") or chat_key
             for msg in payload.get("messages") or []:
@@ -419,29 +659,31 @@ def cmd_search(
                     matches += 1
                     badges: list[str] = []
                     if msg.get("is_deleted"):
-                        badges.append("[red]APAGADA[/red]")
+                        badges.append("[red]DELETED[/red]")
                     if msg.get("revisions"):
-                        badges.append(f"[yellow]EDITADA({len(msg['revisions'])})[/yellow]")
+                        badges.append(f"[yellow]EDITED({len(msg['revisions'])})[/yellow]")
                     badge_str = (" " + " ".join(badges)) if badges else ""
-                    sender = (msg.get("sender") or {}).get("name") or "?"
-                    snippet = str(msg.get("text") or "").replace("\n", " ")[:180]
+                    # Archived text is Telegram content: no Rich markup, no control chars
+                    sender = escape(single_line((msg.get("sender") or {}).get("name") or "?"))
+                    snippet = escape(single_line(msg.get("text") or "")[:180])
                     console.print(
-                        f"[cyan]{title}[/cyan] (`{part_file.name}`) "
-                        f"#{msg.get('id')} [{msg.get('date')}] "
+                        f"[cyan]{escape(single_line(title))}[/cyan] (`{part_file.name}`) "
+                        f"#{msg.get('id')} {escape('[' + str(msg.get('date')) + ']')} "
                         f"[bold]{sender}[/bold]{badge_str}: {snippet}"
                     )
                     if matches >= limit:
-                        console.print(f"[dim]Limite de {limit} resultados atingido.[/dim]")
+                        console.print(f"[dim]Limit of {limit} results reached.[/dim]")
                         return
 
     if matches == 0:
-        console.print("[yellow]Nenhum resultado encontrado.[/yellow]")
+        console.print("[yellow]No results found.[/yellow]")
 
 
 @app.command("stats")
 def cmd_stats(data_dir: DataDirOption = None) -> None:
-    """Exibe estatísticas completas do acervo plain-text e do banco de checkpoints."""
+    """Show full statistics of the plain-text archive and the checkpoint database."""
     cfg = _resolve_runtime_config(data_dir=data_dir)
+    _require_current_layout(cfg)
     with CheckpointDB(cfg.checkpoint_db_path) as db:
         db_counts = db.summary_counts()
 
@@ -451,27 +693,27 @@ def cmd_stats(data_dir: DataDirOption = None) -> None:
     for _, cdir in chat_dirs:
         part_files_count += len(iter_all_part_files(cdir))
         for cat in ALL_MEDIA_CATEGORIES:
-            sub = cdir / cat
+            sub = cdir.media_dir(cat)
             if sub.exists():
                 folder_counts[cat] += sum(
                     1 for f in sub.iterdir() if f.is_file() and not f.name.startswith(".")
                 )
 
-    table = Table(title=f"Estatísticas do Acervo ({cfg.data_dir})")
-    table.add_column("Indicador", style="cyan")
-    table.add_column("Valor", justify="right", style="bold")
-    table.add_row("Contas cadastradas", str(db_counts["accounts"]))
-    table.add_row("Pastas de chat no disco", str(len(chat_dirs)))
-    table.add_row("Chats compartilhados entre 2+ contas", str(db_counts["shared_chats"]))
-    table.add_row("Arquivos JSON particionados (*-ptNNN.json)", str(part_files_count))
-    table.add_row("Mensagens indexadas", str(db_counts["messages"]))
-    table.add_row("Mensagens apagadas preservadas", str(db_counts["deleted_messages"]))
-    table.add_row("Fotos em photos/", str(folder_counts["photos"]))
-    table.add_row("Vídeos em videos/", str(folder_counts["videos"]))
-    table.add_row("Áudios em audio/", str(folder_counts["audio"]))
-    table.add_row("Outros arquivos em files/", str(folder_counts["files"]))
-    table.add_row("Mídias únicas no índice global", str(db_counts["unique_media_files"]))
-    table.add_row("Mídias pendentes (checkbox desmarcado)", str(db_counts["pending_media"]))
+    table = Table(title=f"Archive statistics ({cfg.data_dir})")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right", style="bold")
+    table.add_row("Registered accounts", str(db_counts["accounts"]))
+    table.add_row("Chat folders on disk", str(len(chat_dirs)))
+    table.add_row("Chats shared by 2+ accounts", str(db_counts["shared_chats"]))
+    table.add_row("Partitioned JSON files (*-ptNNN.json)", str(part_files_count))
+    table.add_row("Indexed messages", str(db_counts["messages"]))
+    table.add_row("Preserved deleted messages", str(db_counts["deleted_messages"]))
+    table.add_row("Photos in photos/", str(folder_counts["photos"]))
+    table.add_row("Videos in videos/", str(folder_counts["videos"]))
+    table.add_row("Audio in audio/", str(folder_counts["audio"]))
+    table.add_row("Other files in files/", str(folder_counts["files"]))
+    table.add_row("Unique media in the global index", str(db_counts["unique_media_files"]))
+    table.add_row("Pending media (checkbox unchecked)", str(db_counts["pending_media"]))
     console.print(table)
 
 
@@ -480,14 +722,16 @@ def cmd_stats(data_dir: DataDirOption = None) -> None:
 # ----------------------------------------------------------------------
 @app.command("rebuild-checkpoint")
 def cmd_rebuild_checkpoint(data_dir: DataDirOption = None) -> None:
-    """Reconstrói `<data_dir>/.tghoard/checkpoint.db` varrendo apenas as pastas plain-text."""
+    """Rebuild `<data_dir>/.tghoard/checkpoint.db` by scanning only the plain-text folders."""
     cfg = _resolve_runtime_config(data_dir=data_dir)
-    with CheckpointDB(cfg.checkpoint_db_path) as db:
+    _require_current_layout(cfg)
+    with _writer_lock(cfg, "rebuild-checkpoint"), CheckpointDB(cfg.checkpoint_db_path) as db:
         rep = rebuild_checkpoint_from_plaintext(cfg.data_dir, db)
     console.print(
-        f"[green]✓ Checkpoint reconstruído com sucesso![/green] "
-        f"Chats: {rep.chats_scanned} | Partes JSON: {rep.part_files_scanned} | "
-        f"Mensagens: {rep.messages_indexed} | Mídias: {rep.media_files_indexed}"
+        f"[green]✓ Checkpoint rebuilt successfully![/green] "
+        f"Chats: {rep.chats_scanned} | JSON parts: {rep.part_files_scanned} | "
+        f"Messages: {rep.messages_indexed} | Synced ranges: {rep.synced_ranges} | "
+        f"Media: {rep.media_files_indexed} | Re-queued media: {rep.pending_media_queued}"
     )
 
 
@@ -495,17 +739,265 @@ def cmd_rebuild_checkpoint(data_dir: DataDirOption = None) -> None:
 def cmd_rebuild_md(
     data_dir: DataDirOption = None,
     chat: Annotated[
-        str | None, typer.Option("--chat", "-c", help="Filtrar chat específico.")
+        str | None, typer.Option("--chat", "-c", help="Filter a specific chat.")
     ] = None,
 ) -> None:
-    """Regenera `links.md` e `metadata/deleted_and_edits.md` a partir dos JSONs `*-ptNNN.json`."""
+    """Regenerate `links/<folder>.md` and `deleted_and_edits.md` from the `*-ptNNN.json` files."""
     cfg = _resolve_runtime_config(data_dir=data_dir)
-    rep = rebuild_markdown_from_plaintext(cfg.data_dir, chat_filter=chat)
+    _require_current_layout(cfg)
+    with _writer_lock(cfg, "rebuild-md"):
+        rep = rebuild_markdown_from_plaintext(cfg.data_dir, chat_filter=chat)
     console.print(
-        f"[green]✓ Relatórios Markdown atualizados![/green] "
-        f"Chats: {rep.chats_scanned} | Partes lidas: {rep.part_files_scanned} | "
-        f"Links extraídos: {rep.links_rebuilt}"
+        f"[green]✓ Markdown reports updated![/green] "
+        f"Chats: {rep.chats_scanned} | Parts read: {rep.part_files_scanned} | "
+        f"Links extracted: {rep.links_rebuilt}"
     )
+
+
+# ----------------------------------------------------------------------
+# 7. Web UI standalone (`tghoard web`)
+# ----------------------------------------------------------------------
+@app.command("web")
+def cmd_web(
+    data_dir: DataDirOption = None,
+    port: Annotated[
+        int | None, typer.Option("--port", help="Port (default: TGHOARD_WEB_PORT or 8765).")
+    ] = None,
+    no_browser: Annotated[
+        bool, typer.Option("--no-browser", help="Do not open the browser automatically.")
+    ] = False,
+) -> None:
+    """Open only the web UI (edit chats.md and view statistics), without connecting to Telegram."""
+    cfg = _resolve_runtime_config(data_dir=data_dir)
+    _require_current_layout(cfg)
+    if not cfg.chats_manifest_path.exists():
+        console.print("[red]chats.md not found. Run `tghoard start` first.[/red]")
+        raise typer.Exit(code=1)
+    web = WebUI(
+        data_dir=cfg.data_dir,
+        manifest_path=cfg.chats_manifest_path,
+        db_path=cfg.checkpoint_db_path,
+        bridge=TelegramBridge(cfg.internal_dir),  # cache only (not connected)
+        port=port if port is not None else cfg.web_port,
+    )
+    url = web.start()
+    console.print(f"🌐 Web UI: [bold][link={url}]{url}[/link][/bold] — Ctrl+C to quit")
+    if sys.stdin.isatty() and not no_browser:
+        webbrowser.open(url)
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        web.stop()
+
+
+# ----------------------------------------------------------------------
+# 8. Utilities
+# ----------------------------------------------------------------------
+@app.command("folder-links")
+def cmd_folder_links(
+    data_dir: DataDirOption = None,
+    fmt: Annotated[
+        str, typer.Option("--format", "-f", help="md (default), txt (one URL per line) or csv.")
+    ] = "md",
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Output file (default: <data_dir>/folder_links.<ext>; - = stdout).",
+        ),
+    ] = None,
+    account: Annotated[
+        str | None, typer.Option("--account", "-a", help="Only this account (alias).")
+    ] = None,
+    folder: Annotated[
+        str | None, typer.Option("--folder", help="Only folders whose name contains this text.")
+    ] = None,
+    only_channels: Annotated[
+        bool, typer.Option("--only-channels", help="Only channels and supergroups.")
+    ] = False,
+    only_public: Annotated[
+        bool,
+        typer.Option("--only-public", help="Only public links (t.me/<username>)."),
+    ] = False,
+) -> None:
+    """Generate links to every chat in each Telegram folder (offline, from the archive)."""
+    from tghoard.utils.folder_links import RENDERERS, build_folder_links
+
+    cfg = _resolve_runtime_config(data_dir=data_dir)
+    _require_current_layout(cfg)
+    if fmt not in RENDERERS:
+        console.print(f"[red]Invalid format `{fmt}` (use md, txt or csv).[/red]")
+        raise typer.Exit(code=2)
+    folders = build_folder_links(cfg.data_dir, only_channels=only_channels, only_public=only_public)
+    if not folders:
+        console.print(
+            "[yellow]No folders found. Run `tghoard sync` (or `tghoard start`) to "
+            "fetch your Telegram folders.[/yellow]"
+        )
+        raise typer.Exit(code=1)
+    if account:
+        folders = [f for f in folders if f.account == account]
+    if folder:
+        folders = [f for f in folders if folder.lower() in f.title.lower()]
+
+    text = RENDERERS[fmt](folders)
+    if output is not None and str(output) == "-":
+        sys.stdout.write(text)
+        return
+    target = output or cfg.data_dir / f"folder_links.{fmt}"
+    atomic_write_text(target, text)
+    n_links = sum(1 for f in folders for link in f.links if link.url)
+    console.print(f"[green]✓ {n_links} link(s) from {len(folders)} folder(s) → {target}[/green]")
+
+
+@app.command("verify-media")
+def cmd_verify_media(
+    data_dir: DataDirOption = None,
+    fix: Annotated[
+        bool,
+        typer.Option(
+            "--fix",
+            help="Mark missing/corrupted files in the JSON and queue them for the next "
+            "sync to download again (without it, only reports).",
+        ),
+    ] = False,
+    check_hash: Annotated[
+        bool, typer.Option("--hash", help="Also check SHA-256 (slow on large archives).")
+    ] = False,
+    chat: Annotated[
+        str | None, typer.Option("--chat", "-c", help="Only this chat (chat_key or folder).")
+    ] = None,
+    show: Annotated[int, typer.Option("--show", help="How many problems to list.")] = 30,
+) -> None:
+    """Check that every media file the JSONs say was downloaded exists on disk (offline)."""
+    from tghoard.utils.verify_media import verify_media
+
+    cfg = _resolve_runtime_config(data_dir=data_dir)
+    _require_current_layout(cfg)
+    db = CheckpointDB(cfg.checkpoint_db_path) if cfg.checkpoint_db_path.exists() else None
+    try:
+        with console.status("Checking media…"):
+            with _writer_lock(cfg, "verify-media --fix") if fix else contextlib.nullcontext():
+                rep = verify_media(
+                    cfg.data_dir, db, fix=fix, check_hash=check_hash, chat_filter=chat
+                )
+    finally:
+        if db is not None:
+            db.close()
+
+    table = Table(title=f"Media verification ({cfg.data_dir})")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Total", justify="right", style="bold")
+    table.add_row("Chats checked", str(rep.chats))
+    table.add_row("Media in the JSONs", str(rep.media_checked))
+    table.add_row("OK on disk", f"[green]{rep.ok}[/green]")
+    table.add_row(
+        "Not downloaded yet (queued)", str(rep.not_downloaded - rep.count("lost_from_queue"))
+    )
+    table.add_row("Missing on disk", f"[red]{rep.count('missing')}[/red]")
+    table.add_row("Size mismatch", f"[red]{rep.count('size_mismatch')}[/red]")
+    if check_hash:
+        table.add_row("SHA-256 mismatch", f"[red]{rep.count('hash_mismatch')}[/red]")
+    table.add_row(
+        "Not downloaded and not queued", f"[yellow]{rep.count('lost_from_queue')}[/yellow]"
+    )
+    console.print(table)
+    for p in rep.problems[:show]:
+        where = escape(f" `{p.path}`") if p.path else ""
+        console.print(
+            f"  • {escape(f'[{p.kind}]')} {p.chat_key} #{p.msg_id}{where} {escape(p.detail)}"
+        )
+    if len(rep.problems) > show:
+        console.print(f"  … and {len(rep.problems) - show} more (use --show N)")
+    if not rep.problems:
+        console.print("[green]✓ All recorded media is on disk.[/green]")
+    elif fix:
+        console.print(
+            f"[green]✓ {rep.requeued} media file(s) queued and "
+            f"{rep.json_files_updated} JSON(s) updated.[/green] The next "
+            "[bold]tghoard sync[/bold] downloads them again (for the categories checked in "
+            "chats.md)."
+        )
+    else:
+        cmd = "./tghoard.sh verify-media" + (f" --chat {chat}" if chat else "") + " --fix"
+        console.print(
+            "[yellow]Nothing was changed.[/yellow] To queue the problems for download, "
+            f"stop the sync and run:\n  [bold]{escape(cmd)}[/bold]"
+        )
+        raise typer.Exit(code=1)
+
+
+# ----------------------------------------------------------------------
+# 9. Data migrations (`src/tghoard/migrations/`)
+# ----------------------------------------------------------------------
+@app.command("migrate")
+def cmd_migrate(
+    data_dir: DataDirOption = None,
+    apply: Annotated[
+        bool,
+        typer.Option("--apply", help="Run the migrations (without it, only shows the plan)."),
+    ] = False,
+) -> None:
+    """Migrate the archive to the current layout. Without `--apply`, only shows the plan."""
+    cfg = _resolve_runtime_config(data_dir=data_dir)
+    applied = load_applied(cfg)
+    pending = pending_migrations(cfg)
+
+    table = Table(title=f"Migrations ({cfg.data_dir})")
+    table.add_column("ID", style="cyan")
+    table.add_column("Description")
+    table.add_column("State", justify="right")
+    for mig in discover_migrations():
+        if mig.key in applied:
+            state = f"[green]applied {applied[mig.key]}[/green]"
+        elif mig in pending:
+            state = "[yellow]pending[/yellow]"
+        else:
+            state = "[dim]not needed[/dim]"
+        table.add_row(mig.key, escape(mig.description), state)
+    console.print(table)
+
+    if not pending:
+        console.print("[green]✓ Archive is already on the current layout.[/green]")
+        return
+
+    for mig in pending:
+        plan = mig.plan(cfg)
+        console.print(f"\n[bold cyan]▶ {mig.key}[/bold cyan] — {escape(plan.summary)}")
+        for step in plan.steps:
+            console.print(f"  • {escape(step)}")
+        if plan.table_rows:
+            ptable = Table()
+            for header in plan.table_headers:
+                ptable.add_column(header)
+            for row in plan.table_rows:
+                ptable.add_row(*(escape(c) for c in row))
+            console.print(ptable)
+
+    if not apply:
+        console.print(
+            "\n[yellow]Preview mode: nothing was changed.[/yellow] "
+            "Run [bold]tghoard migrate --apply[/bold] to execute it."
+        )
+        return
+
+    for mig in discover_migrations():
+        if mig.key in load_applied(cfg) or not mig.is_needed(cfg):
+            continue
+        console.print(f"\n[bold]Applying {mig.key}...[/bold]")
+        with _writer_lock(cfg, "migrate --apply"):
+            mig.apply(cfg, console)
+        if mig.is_needed(cfg):
+            console.print(
+                f"[red]✗ {mig.key} did not finish (see warnings above); "
+                "run it again to resume.[/red]"
+            )
+            raise typer.Exit(code=1)
+        record_applied(cfg, mig)
+        console.print(f"[green]✓ {mig.key} applied.[/green]")
 
 
 if __name__ == "__main__":

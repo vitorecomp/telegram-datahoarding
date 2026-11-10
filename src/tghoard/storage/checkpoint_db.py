@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from collections.abc import Iterable
+import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS chat_account_cursors (
     last_story_id        INTEGER,
     last_admin_event_id  INTEGER,
     updated_at           TEXT NOT NULL,
+    forward_max_id       INTEGER,
     PRIMARY KEY (chat_key, account_id)
 );
 
@@ -97,6 +99,9 @@ CREATE TABLE IF NOT EXISTS pending_media (
     mime_type      TEXT,
     size_bytes     INTEGER,
     downloaded     INTEGER NOT NULL DEFAULT 0,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    retry_after    REAL,
     PRIMARY KEY (chat_key, canonical_key)
 );
 
@@ -114,12 +119,54 @@ CREATE TABLE IF NOT EXISTS media_index (
     PRIMARY KEY (tg_type, tg_id)
 );
 
+CREATE TABLE IF NOT EXISTS chat_membership (
+    chat_key       TEXT NOT NULL,
+    account_id     INTEGER NOT NULL,
+    joined_at      TEXT,
+    inviter_id     INTEGER,
+    source         TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    PRIMARY KEY (chat_key, account_id)
+);
+
+CREATE TABLE IF NOT EXISTS chat_metadata_state (
+    chat_key       TEXT NOT NULL,
+    account_id     INTEGER NOT NULL,
+    synced_at      REAL NOT NULL,
+    PRIMARY KEY (chat_key, account_id)
+);
+
 CREATE TABLE IF NOT EXISTS chat_profile_state (
     chat_key       TEXT PRIMARY KEY,
     state_json     TEXT NOT NULL,
     updated_at     TEXT NOT NULL
 );
 """
+
+# Indexes on columns added by `_migrate` (created after the columns exist).
+POST_MIGRATION_SQL = """
+CREATE INDEX IF NOT EXISTS idx_pending_media_order
+    ON pending_media (chat_key, downloaded, day_str, msg_id, canonical_key);
+"""
+
+PENDING_PAGE_SIZE = 1000
+
+# Permanent media failures (the message or its media no longer exists on the server) are
+# retried on every sync for the first few attempts, then with an exponential backoff
+# (1 day, 2, 4, ... capped at 30 days). They stay in `pending_media` (`downloaded = 0`,
+# `last_error` set), so `verify-media` and the stats keep showing them.
+PERMANENT_FAILURE_FREE_ATTEMPTS = 3
+PERMANENT_FAILURE_BASE_BACKOFF_SECS = 24 * 3600.0
+PERMANENT_FAILURE_MAX_BACKOFF_SECS = 30 * 24 * 3600.0
+
+
+def permanent_failure_retry_after(attempts: int, now: float) -> float | None:
+    """When a permanently failing media item may be retried again (`None` = next sync)."""
+    over = attempts - PERMANENT_FAILURE_FREE_ATTEMPTS
+    if over <= 0:
+        return None
+    delay = PERMANENT_FAILURE_BASE_BACKOFF_SECS * (2 ** min(over - 1, 16))
+    return now + min(PERMANENT_FAILURE_MAX_BACKOFF_SECS, delay)
 
 
 @dataclass
@@ -164,6 +211,8 @@ class PendingMediaRow:
     file_name: str | None
     mime_type: str | None
     size_bytes: int | None
+    attempts: int = 0
+    last_error: str | None = None
 
 
 @dataclass
@@ -185,10 +234,30 @@ class CheckpointDB:
         self._conn = sqlite3.connect(str(self.db_path), isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA_SQL)
+        self._migrate()
         try:
             os.chmod(self.db_path, 0o600)
         except OSError:
             pass
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first release to existing databases."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(pending_media)")}
+        if "attempts" not in cols:
+            self._conn.execute(
+                "ALTER TABLE pending_media ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_error" not in cols:
+            self._conn.execute("ALTER TABLE pending_media ADD COLUMN last_error TEXT")
+        if "retry_after" not in cols:
+            self._conn.execute("ALTER TABLE pending_media ADD COLUMN retry_after REAL")
+        cursor_cols = {
+            r["name"] for r in self._conn.execute("PRAGMA table_info(chat_account_cursors)")
+        }
+        if "forward_max_id" not in cursor_cols:
+            # NULL on existing rows: `sync` derives a safe starting point (see messages_sync)
+            self._conn.execute("ALTER TABLE chat_account_cursors ADD COLUMN forward_max_id INTEGER")
+        self._conn.executescript(POST_MIGRATION_SQL)
 
     def close(self) -> None:
         self._conn.close()
@@ -348,28 +417,66 @@ class CheckpointDB:
             "WHERE chat_key = ? ORDER BY start_id ASC",
             (chat_key,),
         ).fetchall()
-        return [(int(r["start_id"]), int(r["end_id"])) for r in rows]
+        # Stored ranges are kept merged by `add_synced_ranges`; merging on read (linear on
+        # already-sorted rows) also normalizes rows written by anything else.
+        return merge_ranges((int(r["start_id"]), int(r["end_id"])) for r in rows)
 
-    def add_synced_range(self, chat_key: str, start_id: int, end_id: int) -> list[tuple[int, int]]:
-        current = self.get_synced_ranges(chat_key)
-        merged = merge_ranges([*current, (start_id, end_id)])
+    def add_synced_range(self, chat_key: str, start_id: int, end_id: int) -> None:
+        self.add_synced_ranges(chat_key, [(start_id, end_id)])
+
+    def add_synced_ranges(self, chat_key: str, ranges: Iterable[tuple[int, int]]) -> None:
+        """Mark many id ranges as synced, in one transaction.
+
+        Incremental: each range only touches the stored ranges it overlaps or touches
+        (index lookups on `(chat_key, start_id)`), instead of re-reading and rewriting every
+        range of the chat — closing thousands of small holes used to be quadratic.
+        """
+        incoming = merge_ranges(ranges)
+        if not incoming:
+            return
         now = utc_now_iso()
-        self._conn.execute("BEGIN")
+        conn = self._conn
+        conn.execute("BEGIN")
         try:
-            self._conn.execute(
-                "DELETE FROM chat_synced_ranges WHERE chat_key = ?",
-                (chat_key,),
-            )
-            self._conn.executemany(
-                "INSERT INTO chat_synced_ranges (chat_key, start_id, end_id, updated_at) "
-                "VALUES (?, ?, ?, ?)",
-                [(chat_key, s, e, now) for s, e in merged],
-            )
-            self._conn.execute("COMMIT")
+            for start, end in incoming:
+                new_start, new_end = start, end
+                # Stored ranges are disjoint and non-adjacent, so at most one range that
+                # starts before `start` can overlap/touch [start, end]: the closest one.
+                left = conn.execute(
+                    "SELECT start_id, end_id FROM chat_synced_ranges "
+                    "WHERE chat_key = ? AND start_id < ? ORDER BY start_id DESC LIMIT 1",
+                    (chat_key, start),
+                ).fetchone()
+                if left is not None and int(left["end_id"]) >= start - 1:
+                    if int(left["end_id"]) >= end:
+                        continue  # already covered
+                    new_start = int(left["start_id"])
+                    conn.execute(
+                        "DELETE FROM chat_synced_ranges WHERE chat_key = ? AND start_id = ?",
+                        (chat_key, new_start),
+                    )
+                # Every range starting inside [start, end + 1] overlaps or touches it
+                inner = conn.execute(
+                    "SELECT MAX(end_id) AS max_end FROM chat_synced_ranges "
+                    "WHERE chat_key = ? AND start_id BETWEEN ? AND ?",
+                    (chat_key, start, end + 1),
+                ).fetchone()
+                if inner is not None and inner["max_end"] is not None:
+                    new_end = max(new_end, int(inner["max_end"]))
+                    conn.execute(
+                        "DELETE FROM chat_synced_ranges "
+                        "WHERE chat_key = ? AND start_id BETWEEN ? AND ?",
+                        (chat_key, start, end + 1),
+                    )
+                conn.execute(
+                    "INSERT INTO chat_synced_ranges (chat_key, start_id, end_id, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (chat_key, new_start, new_end, now),
+                )
+            conn.execute("COMMIT")
         except BaseException:
-            self._conn.execute("ROLLBACK")
+            conn.execute("ROLLBACK")
             raise
-        return merged
 
     def get_missing_ranges(
         self,
@@ -397,7 +504,13 @@ class CheckpointDB:
         backfill_completed: bool | None = None,
         last_story_id: int | None = None,
         last_admin_event_id: int | None = None,
+        forward_max_id: int | None = None,
     ) -> None:
+        """Upsert a chat/account cursor; `None` arguments keep the stored value.
+
+        `forward_max_id` (DMs, Saved Messages, basic groups) is the highest message id up to
+        which `sync` itself walked the history contiguously; it only ever moves forward.
+        """
         existing = self.get_chat_cursor(chat_key, account_id)
         now = utc_now_iso()
         final_offset = (
@@ -420,20 +533,28 @@ class CheckpointDB:
             if last_admin_event_id is not None
             else (existing["last_admin_event_id"] if existing else None)
         )
+        old_forward = existing.get("forward_max_id") if existing else None
+        final_forward = (
+            max(int(old_forward or 0), int(forward_max_id))
+            if forward_max_id is not None
+            else old_forward
+        )
         self._conn.execute(
             """
             INSERT INTO chat_account_cursors (
                 chat_key, account_id, folder_rel_path, backfill_offset_id,
-                backfill_completed, last_story_id, last_admin_event_id, updated_at
+                backfill_completed, last_story_id, last_admin_event_id, updated_at,
+                forward_max_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chat_key, account_id) DO UPDATE SET
                 folder_rel_path = excluded.folder_rel_path,
                 backfill_offset_id = excluded.backfill_offset_id,
                 backfill_completed = excluded.backfill_completed,
                 last_story_id = excluded.last_story_id,
                 last_admin_event_id = excluded.last_admin_event_id,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                forward_max_id = excluded.forward_max_id
             """,
             (
                 chat_key,
@@ -444,6 +565,7 @@ class CheckpointDB:
                 final_story,
                 final_admin,
                 now,
+                final_forward,
             ),
         )
 
@@ -454,6 +576,53 @@ class CheckpointDB:
             (chat_key,),
         ).fetchone()
         return str(row["folder_rel_path"]) if row is not None else None
+
+    # ------------------------------------------------------------------
+    # Membership (when each account joined each chat)
+    # ------------------------------------------------------------------
+    def set_memberships(self, rows: Iterable[tuple[str, int, str | None, int | None, str]]) -> None:
+        """Upsert `(chat_key, account_id, joined_at_iso, inviter_id, source)` rows."""
+        now = utc_now_iso()
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.executemany(
+                """
+                INSERT INTO chat_membership
+                    (chat_key, account_id, joined_at, inviter_id, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_key, account_id) DO UPDATE SET
+                    joined_at = excluded.joined_at,
+                    inviter_id = COALESCE(excluded.inviter_id, chat_membership.inviter_id),
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                [(ck, acc, joined, inviter, src, now) for ck, acc, joined, inviter, src in rows],
+            )
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def metadata_synced_at(self, chat_key: str, account_id: int) -> float | None:
+        """Unix time of the last metadata refresh of `chat_key` by `account_id`."""
+        row = self._conn.execute(
+            "SELECT synced_at FROM chat_metadata_state WHERE chat_key = ? AND account_id = ?",
+            (chat_key, account_id),
+        ).fetchone()
+        return float(row["synced_at"]) if row is not None else None
+
+    def mark_metadata_synced(self, chat_key: str, account_id: int, when: float) -> None:
+        self._conn.execute(
+            "INSERT INTO chat_metadata_state (chat_key, account_id, synced_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(chat_key, account_id) DO UPDATE SET synced_at = excluded.synced_at",
+            (chat_key, account_id, when),
+        )
+
+    def get_memberships(self, chat_key: str) -> dict[int, dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM chat_membership WHERE chat_key = ?", (chat_key,)
+        ).fetchall()
+        return {int(r["account_id"]): dict(r) for r in rows}
 
     def list_chat_accounts(self, chat_key: str) -> list[AccountRecord]:
         rows = self._conn.execute(
@@ -580,6 +749,24 @@ class CheckpointDB:
             ).fetchall()
         return [self._row_to_located(r) for r in rows]
 
+    def is_account_msg_known(self, account_id: int, chat_key: str, msg_id: int) -> bool:
+        """Whether `account_id` already archived its message `msg_id` of `chat_key`."""
+        row = self._conn.execute(
+            "SELECT 1 FROM account_message_map "
+            "WHERE account_id = ? AND chat_key = ? AND msg_id = ?",
+            (account_id, chat_key, msg_id),
+        ).fetchone()
+        return row is not None
+
+    def account_maps_canonical(self, account_id: int, chat_key: str, canonical_key: str) -> bool:
+        """Whether one of `account_id`'s messages in `chat_key` is mapped to `canonical_key`."""
+        row = self._conn.execute(
+            "SELECT 1 FROM account_message_map "
+            "WHERE account_id = ? AND chat_key = ? AND canonical_key = ? LIMIT 1",
+            (account_id, chat_key, canonical_key),
+        ).fetchone()
+        return row is not None
+
     def mark_locator_deleted(self, chat_key: str, canonical_key: str) -> None:
         self._conn.execute(
             "UPDATE message_locator SET is_deleted = 1 WHERE chat_key = ? AND canonical_key = ?",
@@ -629,45 +816,213 @@ class CheckpointDB:
             ),
         )
 
+    @staticmethod
+    def _row_to_pending(r: sqlite3.Row) -> PendingMediaRow:
+        return PendingMediaRow(
+            chat_key=str(r["chat_key"]),
+            canonical_key=str(r["canonical_key"]),
+            account_id=int(r["account_id"]),
+            msg_id=int(r["msg_id"]),
+            day_str=str(r["day_str"]),
+            category=r["category"],
+            tg_type=str(r["tg_type"]),
+            tg_id=int(r["tg_id"]),
+            file_name=r["file_name"],
+            mime_type=r["mime_type"],
+            size_bytes=int(r["size_bytes"]) if r["size_bytes"] is not None else None,
+            attempts=int(r["attempts"] or 0),
+            last_error=r["last_error"],
+        )
+
+    def list_pending_media_page(
+        self,
+        chat_key: str,
+        categories: Iterable[MediaCategory],
+        *,
+        after: tuple[str, int, str] | None = None,
+        limit: int = PENDING_PAGE_SIZE,
+        due_at: float | None = None,
+    ) -> list[PendingMediaRow]:
+        """One page of a chat's pending media, ordered by `(day_str, msg_id, canonical_key)`.
+
+        Keyset pagination: pass the last row's `(day_str, msg_id, canonical_key)` as
+        `after` to get the next page. With `due_at` (unix time), rows still in a
+        permanent-failure backoff (`retry_after > due_at`) are left out.
+        """
+        cats = list(categories)
+        if not cats:
+            return []
+        placeholders = ",".join("?" for _ in cats)
+        sql = (
+            "SELECT * FROM pending_media "
+            f"WHERE chat_key = ? AND downloaded = 0 AND category IN ({placeholders})"
+        )
+        params: list[Any] = [chat_key, *cats]
+        if due_at is not None:
+            sql += " AND (retry_after IS NULL OR retry_after <= ?)"
+            params.append(due_at)
+        if after is not None:
+            sql += " AND (day_str, msg_id, canonical_key) > (?, ?, ?)"
+            params.extend(after)
+        sql += " ORDER BY day_str ASC, msg_id ASC, canonical_key ASC LIMIT ?"
+        params.append(int(limit))
+        return [self._row_to_pending(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def iter_pending_media_pages(
+        self,
+        chat_key: str,
+        categories: Iterable[MediaCategory],
+        *,
+        page_size: int = PENDING_PAGE_SIZE,
+        due_at: float | None = None,
+    ) -> Iterator[list[PendingMediaRow]]:
+        """Lazily yield pages of pending media (one query per page, nothing held open)."""
+        cats = list(categories)
+        after: tuple[str, int, str] | None = None
+        while True:
+            page = self.list_pending_media_page(
+                chat_key, cats, after=after, limit=page_size, due_at=due_at
+            )
+            if not page:
+                return
+            yield page
+            if len(page) < page_size:
+                return
+            last = page[-1]
+            after = (last.day_str, last.msg_id, last.canonical_key)
+
     def list_pending_media(
         self,
         chat_key: str,
         categories: Iterable[MediaCategory],
     ) -> list[PendingMediaRow]:
+        """Every pending item of the chat for `categories` (including backed-off ones)."""
+        return [row for page in self.iter_pending_media_pages(chat_key, categories) for row in page]
+
+    def pending_media_summary(
+        self,
+        chat_key: str,
+        categories: Iterable[MediaCategory],
+        *,
+        max_bytes: int | None,
+        due_at: float,
+    ) -> dict[str, int]:
+        """Counts for the drain: `due` (within the size limit, not backed off), `oversized`,
+        `retrying` (due items that failed before) and `backed_off`."""
         cats = list(categories)
         if not cats:
-            return []
+            return {"due": 0, "oversized": 0, "retrying": 0, "backed_off": 0}
         placeholders = ",".join("?" for _ in cats)
-        rows = self._conn.execute(
+        limit = max_bytes if max_bytes is not None else -1
+        row = self._conn.execute(
             f"""
-            SELECT * FROM pending_media
+            SELECT
+                SUM(CASE WHEN ? >= 0 AND COALESCE(size_bytes, 0) > ? THEN 1 ELSE 0 END)
+                    AS oversized,
+                SUM(CASE WHEN retry_after IS NOT NULL AND retry_after > ? THEN 1 ELSE 0 END)
+                    AS backed_off,
+                SUM(CASE WHEN NOT (? >= 0 AND COALESCE(size_bytes, 0) > ?)
+                          AND (retry_after IS NULL OR retry_after <= ?) THEN 1 ELSE 0 END)
+                    AS due,
+                SUM(CASE WHEN NOT (? >= 0 AND COALESCE(size_bytes, 0) > ?)
+                          AND (retry_after IS NULL OR retry_after <= ?)
+                          AND last_error IS NOT NULL THEN 1 ELSE 0 END)
+                    AS retrying
+            FROM pending_media
             WHERE chat_key = ? AND downloaded = 0 AND category IN ({placeholders})
-            ORDER BY day_str ASC, msg_id ASC
             """,
-            (chat_key, *cats),
-        ).fetchall()
-        return [
-            PendingMediaRow(
-                chat_key=str(r["chat_key"]),
-                canonical_key=str(r["canonical_key"]),
-                account_id=int(r["account_id"]),
-                msg_id=int(r["msg_id"]),
-                day_str=str(r["day_str"]),
-                category=r["category"],
-                tg_type=str(r["tg_type"]),
-                tg_id=int(r["tg_id"]),
-                file_name=r["file_name"],
-                mime_type=r["mime_type"],
-                size_bytes=int(r["size_bytes"]) if r["size_bytes"] is not None else None,
+            (limit, limit, due_at, limit, limit, due_at, limit, limit, due_at, chat_key, *cats),
+        ).fetchone()
+        return {k: int(row[k] or 0) for k in ("due", "oversized", "retrying", "backed_off")}
+
+    def record_media_failure(
+        self,
+        row: PendingMediaRow,
+        error: str,
+        *,
+        permanent: bool = False,
+        now: float | None = None,
+    ) -> None:
+        """Queue (or re-queue) media whose download failed so the next sync retries it.
+
+        Uses the same `pending_media` queue drained by every `sync`. Transient failures are
+        retried on every sync. `permanent=True` (e.g. the message is gone from the server)
+        is retried on every sync for the first `PERMANENT_FAILURE_FREE_ATTEMPTS` attempts,
+        then with an exponential backoff (`retry_after`); the row stays visible as pending.
+        """
+        retry_after: float | None = None
+        if permanent:
+            cur = self._conn.execute(
+                "SELECT attempts FROM pending_media WHERE chat_key = ? AND canonical_key = ?",
+                (row.chat_key, row.canonical_key),
+            ).fetchone()
+            attempts = (int(cur["attempts"] or 0) if cur is not None else 0) + 1
+            retry_after = permanent_failure_retry_after(
+                attempts, time.time() if now is None else now
             )
-            for r in rows
-        ]
+        self._conn.execute(
+            """
+            INSERT INTO pending_media (
+                chat_key, canonical_key, account_id, msg_id, day_str,
+                category, tg_type, tg_id, file_name, mime_type, size_bytes,
+                downloaded, attempts, last_error, retry_after
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+            ON CONFLICT(chat_key, canonical_key) DO UPDATE SET
+                account_id = excluded.account_id,
+                msg_id = excluded.msg_id,
+                day_str = excluded.day_str,
+                downloaded = 0,
+                attempts = pending_media.attempts + 1,
+                last_error = excluded.last_error,
+                retry_after = excluded.retry_after
+            """,
+            (
+                row.chat_key,
+                row.canonical_key,
+                row.account_id,
+                row.msg_id,
+                row.day_str,
+                row.category,
+                row.tg_type,
+                row.tg_id,
+                row.file_name,
+                row.mime_type,
+                row.size_bytes,
+                error,
+                retry_after,
+            ),
+        )
+
+    def count_failed_media(self) -> int:
+        """Media still awaiting retry after a failed download (across all chats)."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM pending_media "
+            "WHERE downloaded = 0 AND last_error IS NOT NULL"
+        ).fetchone()
+        return int(row["n"])
 
     def mark_pending_media_downloaded(self, chat_key: str, canonical_key: str) -> None:
-        self._conn.execute(
-            "UPDATE pending_media SET downloaded = 1 WHERE chat_key = ? AND canonical_key = ?",
-            (chat_key, canonical_key),
-        )
+        self.mark_pending_media_downloaded_many(chat_key, [canonical_key])
+
+    def mark_pending_media_downloaded_many(
+        self, chat_key: str, canonical_keys: Iterable[str]
+    ) -> None:
+        """Mark many queue rows as downloaded in one transaction."""
+        keys = list(canonical_keys)
+        if not keys:
+            return
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.executemany(
+                "UPDATE pending_media SET downloaded = 1, last_error = NULL, retry_after = NULL "
+                "WHERE chat_key = ? AND canonical_key = ?",
+                [(chat_key, k) for k in keys],
+            )
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def get_indexed_media(self, tg_type: str, tg_id: int) -> IndexedMedia | None:
         row = self._conn.execute(

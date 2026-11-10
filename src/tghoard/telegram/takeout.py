@@ -44,19 +44,19 @@ async def open_sync_session(
         hours = getattr(exc, "seconds", 0) / 3600.0
         if mode == "takeout":
             raise RuntimeError(
-                f"Sessão Takeout em espera de segurança do Telegram ({hours:.1f}h restantes). "
-                "Confirme no app móvel oficial ou use `--mode auto` / `--mode standard`."
+                f"Takeout session on a Telegram security hold ({hours:.1f}h left). "
+                "Confirm it in the official mobile app or use `--mode auto` / `--mode standard`."
             ) from exc
         out.print(
-            f"[yellow]⚠️ Takeout temporariamente retido pelo Telegram ({hours:.1f}h restantes "
-            "para sessão nova). Seguindo automaticamente em modo standard cadenciado.[/yellow]"
+            f"[yellow]⚠️ Takeout temporarily held by Telegram ({hours:.1f}h left "
+            "for a new session). Continuing automatically in paced standard mode.[/yellow]"
         )
     except tg_errors.RPCError as exc:
         if mode == "takeout":
             raise
         out.print(
-            f"[yellow]⚠️ Não foi possível iniciar Takeout ({type(exc).__name__}). "
-            "Seguindo em modo standard cadenciado.[/yellow]"
+            f"[yellow]⚠️ Could not start Takeout ({type(exc).__name__}). "
+            "Continuing in paced standard mode.[/yellow]"
         )
 
     yield client, False

@@ -10,7 +10,7 @@ from telethon.tl import types as tl_types
 
 from tghoard.storage.chats_manifest import ManifestSection
 from tghoard.storage.markdown_writer import extract_links_from_text_and_entities
-from tghoard.storage.paths import ChatKind, make_chat_key
+from tghoard.storage.paths import ChatKind, make_chat_key, single_line
 
 
 @dataclass
@@ -49,13 +49,14 @@ def extract_extra_usernames(entity: Any) -> list[str]:
 
 
 def display_name_of_entity(entity: Any) -> str:
+    """Chat title / user's full name, always on a single line (it lands in line-based files)."""
     if entity is None:
         return "Desconhecido"
-    title = getattr(entity, "title", None)
+    title = single_line(getattr(entity, "title", None) or "")
     if title:
-        return str(title).strip()
-    first = str(getattr(entity, "first_name", "") or "").strip()
-    last = str(getattr(entity, "last_name", "") or "").strip()
+        return title
+    first = single_line(getattr(entity, "first_name", "") or "")
+    last = single_line(getattr(entity, "last_name", "") or "")
     full = f"{first} {last}".strip()
     if full:
         return full
@@ -333,3 +334,15 @@ def serialize_message_to_dict(
         "delete_source": None,
         "seen_by_accounts": [str(account_id)],
     }
+
+
+def channel_join_date(entity: Any) -> str | None:
+    """When *you* joined a channel/supergroup (ISO), from the entity you already have.
+
+    For members, Telegram's `Channel.date` is the join date (for non-members it would be the
+    creation date, so `left` channels are ignored). Basic groups and DMs return None: a basic
+    group's `date` is its creation date (see `metadata_sync` for its join date).
+    """
+    if type(entity).__name__ not in ("Channel", "FakeChannel") or getattr(entity, "left", False):
+        return None
+    return to_utc_iso(getattr(entity, "date", None))

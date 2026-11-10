@@ -1,0 +1,1058 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tghoard</title>
+<style>
+  :root {
+    --bg: #0f0f11; --tile: #1b1b1e; --tile-2: #232327; --line: #2c2c31; --line-2: #38383e;
+    --text: #ecebe4; --muted: #8d8d87; --dim: #5e5e5a;
+    --accent: #4f6189; --accent-2: #7088b8; --accent-soft: #2a3247;
+    --sand: #adaca3; --sand-ink: #18181b;
+    --ok: #3fa66b; --warn: #d4902b; --bad: #d65a5a;
+    --mono: "JetBrains Mono", "IBM Plex Mono", "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+    --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font: 13px/1.45 var(--sans); -webkit-font-smoothing: antialiased; }
+  button, input, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  ::selection { background: var(--accent); }
+
+  /* scrollbars matching the theme (table, log card, page): thin, square, charcoal, no
+     arrow buttons. Chromium uses the ::-webkit-scrollbar rules (it ignores them if the
+     standard properties are set, so those are applied only where WebKit's aren't). */
+  ::-webkit-scrollbar { width: 8px; height: 8px; background: transparent; }
+  ::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #3a3a41; border: 2px solid var(--bg); border-radius: 0; }
+  ::-webkit-scrollbar-thumb:hover { background: #5a5a63; }
+  ::-webkit-scrollbar-corner { background: transparent; }
+  .tile ::-webkit-scrollbar-thumb, #log::-webkit-scrollbar-thumb { border-color: var(--tile); background: #45454d; }
+  .tile ::-webkit-scrollbar-thumb:hover, #log::-webkit-scrollbar-thumb:hover { background: #63636c; }
+  @supports not selector(::-webkit-scrollbar) {  /* Firefox */
+    * { scrollbar-width: thin; scrollbar-color: #3a3a41 transparent; }
+    .tile, #log { scrollbar-color: #45454d transparent; }
+  }
+
+  /* ---------- top bar (ticker) ---------- */
+  .top { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 22px;
+         padding: 12px 22px; background: #0b0b0d; border-bottom: 1px solid var(--line); }
+  .logo { display: flex; align-items: center; gap: 10px; font: 600 13px var(--mono);
+          letter-spacing: .12em; text-transform: uppercase; }
+  .logo .dots { display: grid; grid-template-columns: repeat(3, 4px); gap: 3px; }
+  .logo .dots i { width: 4px; height: 4px; background: var(--text); }
+  .nav { display: flex; gap: 2px; padding-left: 18px; border-left: 1px solid var(--line); }
+  .nav a { font: 12px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted);
+           text-decoration: none; padding: 6px 12px; border: 1px solid transparent; }
+  .nav a:hover { color: var(--text); }
+  .nav a.on { color: var(--text); background: var(--tile-2); border-color: var(--line-2); }
+  .ticker { display: flex; gap: 26px; padding-left: 18px; border-left: 1px solid var(--line);
+            overflow: hidden; flex: 1; }
+  .tk { font-family: var(--mono); white-space: nowrap; }
+  .tk b { display: block; font-weight: 400; font-size: 10px; letter-spacing: .1em;
+          text-transform: uppercase; color: var(--muted); }
+  .tk span { font-size: 12px; }
+  .tk .ok { color: var(--ok); } .tk .warn { color: var(--warn); } .tk .run { color: var(--accent-2); }
+  .cta { font: 600 12px var(--mono); letter-spacing: .08em; text-transform: uppercase;
+         background: var(--text); color: var(--sand-ink); border: 0; padding: 9px 14px; }
+  .cta:hover { background: #fff; }
+
+  main { padding: 18px 22px 40px; }
+  .view { animation: fade .18s ease; }
+  @keyframes fade { from { opacity: .4; } to { opacity: 1; } }
+
+  /* ---------- dashboard tiles ---------- */
+  .grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 10px; }
+  .tile { background: var(--tile); padding: 18px 20px; min-height: 150px; position: relative;
+          display: flex; flex-direction: column; min-width: 0; }
+  .tile.accent { background: var(--accent); }
+  .tile.sand { background: var(--sand); color: var(--sand-ink); }
+  .c2 { grid-column: span 2; } .c3 { grid-column: span 3; } .c4 { grid-column: span 4; } .c5 { grid-column: span 5; }
+  .c6 { grid-column: span 6; } .c7 { grid-column: span 7; } .c8 { grid-column: span 8; }
+  .c9 { grid-column: span 9; } .c12 { grid-column: span 12; } .r2 { grid-row: span 2; }
+  @media (max-width: 1150px) { .c2, .c3 { grid-column: span 6; } .c4, .c5, .c6, .c7, .c8, .c9 { grid-column: span 12; } }
+  @media (max-width: 640px) { .c2, .c3 { grid-column: span 12; } }
+  .ringwrap { flex: 1; min-height: 0; position: relative; }
+  .ringwrap .ring { position: absolute; top: 0; bottom: 0; left: 50%; transform: translateX(-50%);
+                    width: auto; height: 100%; max-width: 100%; aspect-ratio: 1 / 1; margin: 0; }
+  @media (max-width: 699px), (max-height: 479px) {  /* scrolling layout only */
+    .ringwrap { min-height: 180px; }
+  }
+  .runbox { display: flex; flex-direction: column; min-height: 0; }
+  .banner.float { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 40;
+                  margin: 0; box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+
+  /* Dashboard fits the window (no page scroll) on desktop-sized screens: 4 rows share the
+     available height; numbers/ring/titles scale with it. Smaller screens keep scrolling. */
+  @media (min-width: 700px) and (min-height: 480px) {
+    [data-area=chats] { grid-area: chats; } [data-area=msgs] { grid-area: msgs; }
+    [data-area=speed] { grid-area: speed; } [data-area=files] { grid-area: files; }
+    [data-area=pool] { grid-area: pool; } [data-area=ring] { grid-area: ring; }
+    [data-area=thr] { grid-area: thr; } [data-area=bars] { grid-area: bars; }
+    [data-area=sync] { grid-area: sync; } [data-area=run] { grid-area: run; }
+    [data-area=queue] { grid-area: queue; } [data-area=log] { grid-area: log; }
+    body.dash .grid {
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      grid-template-areas:
+        "chats chats chats msgs msgs msgs speed speed speed speed speed speed"
+        "files files files pool pool pool speed speed speed speed speed speed"
+        "ring  ring  thr   thr  bars bars bars  bars  bars  sync  sync  sync"
+        "run   run   run   run  run  queue queue queue log   log   log   log";
+    }
+  }
+  /* medium windows (e.g. tiled side-by-side): 6 columns x 6 rows, still no page scroll */
+  @media (min-width: 700px) and (max-width: 1150px) and (min-height: 480px) {
+    body.dash .grid {
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      grid-template-rows: repeat(6, minmax(0, 1fr)) !important;
+      grid-template-areas:
+        "chats chats msgs  msgs  files files"
+        "speed speed speed speed pool  pool"
+        "speed speed speed speed ring  ring"
+        "thr   thr   bars  bars  bars  bars"
+        "run   run   run   run   sync  sync"
+        "queue queue log   log   log   log";
+    }
+    body.dash .chips button { padding: 2px 4px; }
+    /* 6 shorter rows: scale type to the row height */
+    body.dash .tile { padding: clamp(8px, 1.2vh, 14px) clamp(10px, 1.2vw, 16px); }
+    body.dash .big { font-size: clamp(20px, 3.8vh, 42px); }
+    body.dash .big.md { font-size: clamp(18px, 3.1vh, 32px); }
+    body.dash .lbl { font-size: clamp(9px, 1.2vh, 12px); }
+    body.dash .sandtitle { font-size: clamp(13px, 2.3vh, 24px); }
+    body.dash .suffix, body.dash .foot { font-size: clamp(9px, 1.2vh, 12px); }
+    body.dash .foot { margin-top: 4px; padding-top: 4px; }
+    body.dash .ring .mid b { font-size: clamp(14px, 2.6vh, 30px); }
+    body.dash .ring .mid span { font-size: clamp(8px, 1vh, 10px); }
+  }
+  /* short windows (any width): tighten further */
+  @media (min-width: 700px) and (min-height: 480px) and (max-height: 640px) {
+    body.dash .big { font-size: clamp(18px, 4vh, 34px); }
+    body.dash .big.md { font-size: clamp(16px, 3.3vh, 28px); }
+    body.dash .sandtitle { font-size: clamp(12px, 2.4vh, 20px); }
+    body.dash .foot { display: none; }
+    body.dash .lbl { font-size: 10px; }
+    body.dash .ring .mid span { display: none; }
+    body.dash .ring .mid b { font-size: clamp(13px, 2.6vh, 22px); }
+  }
+  @media (min-width: 700px) and (min-height: 480px) and (max-height: 560px) {
+    body.dash .meter { display: none; }
+  }
+  @media (min-width: 700px) and (min-height: 480px) {
+    body.dash { height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+    body.dash .top { position: static; flex: none; }
+    body.dash main { flex: 1; min-height: 0; padding: 12px 18px; }
+    body.dash #view-dashboard { height: 100%; }
+    body.dash .grid { height: 100%; grid-template-rows: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    body.dash .tile { min-height: 0; overflow: hidden; padding: clamp(10px, 1.6vh, 18px) clamp(12px, 1.3vw, 20px); }
+    body.dash .big { font-size: clamp(26px, 5.2vh, 50px); }
+    body.dash .big.md { font-size: clamp(22px, 4vh, 38px); }
+    body.dash .lbl { font-size: clamp(10px, 1.35vh, 12px); }
+    body.dash #dAccounts .hint { display: none; }  /* pace details live in the Throttle tile */
+    body.dash .pr { grid-template-columns: minmax(80px, 1fr) minmax(50px, 1fr) minmax(0, 1.3fr); gap: 10px; }
+    body.dash .runbox { flex: 1; overflow: hidden;
+                        -webkit-mask-image: linear-gradient(#000 75%, transparent);
+                        mask-image: linear-gradient(#000 75%, transparent); }
+    body.dash .ring .mid b { font-size: clamp(18px, 3.6vh, 36px); }
+    body.dash .chart { min-height: 0; margin-top: 8px; }
+    body.dash .bars { height: auto; flex: 1; min-height: 0; margin-top: 10px; }
+    body.dash .foot { margin-top: 8px; padding-top: 6px; }
+    body.dash .sandtitle { font-size: clamp(16px, 3vh, 28px); }
+    body.dash .rows { margin-top: 8px; gap: 6px; flex: none; }
+    body.dash .q { margin-top: 8px; overflow: hidden; }
+    body.dash #log { max-height: none; flex: 1; min-height: 0; margin-top: 8px; }
+  }
+  .lbl { font: 12px var(--mono); letter-spacing: .09em; text-transform: uppercase;
+         display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .lbl .kebab { color: var(--muted); letter-spacing: 0; }
+  .big { font: 500 50px/1 var(--mono); letter-spacing: -.02em; margin-top: auto; white-space: nowrap; }
+  .big.md { font-size: 38px; }
+  .bigrow { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-top: auto; }
+  .bigrow .big { margin-top: 0; }
+  .suffix { font: 12px var(--mono); color: var(--muted); white-space: nowrap; padding-bottom: 4px; }
+  .tile.accent .suffix, .tile.accent .sub { color: #d7dbe6; }
+  .sub { font: 11px var(--mono); color: var(--muted); letter-spacing: .06em; text-transform: uppercase; }
+  .foot { display: flex; justify-content: space-between; border-top: 1px solid var(--line-2);
+          padding-top: 10px; margin-top: 14px; font: 11px var(--mono); letter-spacing: .06em;
+          text-transform: uppercase; color: var(--muted); }
+  .foot b { color: var(--text); font-weight: 400; }
+  .meter { height: 6px; background: #2e2e33; margin-top: 12px; position: relative; overflow: hidden; }
+  .meter > i { position: absolute; inset: 0 auto 0 0; background: var(--accent-2); transition: width .5s; }
+  .chips { display: flex; gap: 4px; }
+  .chips button { font: 10px var(--mono); letter-spacing: .06em; padding: 3px 6px; border: 0;
+                  background: transparent; color: var(--dim); }
+  .chips button.on { background: #34343a; color: var(--text); }
+  .arrow { width: 30px; height: 30px; border-radius: 50%; border: 0; display: grid; place-items: center;
+           background: var(--text); color: var(--sand-ink); font-size: 15px; }
+  .tile.sand .arrow { background: var(--sand-ink); color: var(--sand); }
+  .sandtitle { font: 500 28px/1.05 var(--mono); letter-spacing: .02em; text-transform: uppercase; margin-top: auto;
+               overflow: hidden; }
+  .tile.sand { justify-content: space-between; }
+  .tile.sand .arrow { width: clamp(22px, 3vh, 30px); height: clamp(22px, 3vh, 30px); font-size: 13px; }
+
+  /* speed chart */
+  .chart { position: relative; flex: 1; min-height: 170px; margin-top: 14px; }
+  .chart .plot { position: absolute; inset: 0 64px 0 0; }
+  .chart svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+  .chart .gl { stroke: #2c2c31; stroke-width: 1; vector-effect: non-scaling-stroke; }
+  .chart .ln { fill: none; stroke: var(--accent-2); stroke-width: 2; vector-effect: non-scaling-stroke; }
+  .chart .ar { fill: url(#grad); }
+  .chart .ylab { position: absolute; right: 0; width: 58px; text-align: right; font: 10px var(--mono);
+                 color: var(--dim); transform: translateY(-50%); }
+  .chart .tip { position: absolute; pointer-events: none; font: 11px var(--mono); background: var(--text);
+                color: var(--sand-ink); padding: 3px 6px; transform: translate(-50%, -130%); white-space: nowrap; }
+  .chart .cur { position: absolute; top: 0; bottom: 0; width: 1px; background: #55555c; pointer-events: none; }
+  .chart .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--dim);
+                  font: 11px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+
+  /* ring gauge */
+  .ring { position: relative; width: 170px; height: 170px; margin: auto; }
+  .ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+  .ring .bg { stroke: #2e2e33; } .ring .fg { stroke: var(--accent-2); transition: stroke-dashoffset .6s; }
+  .ring .mid { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; }
+  .ring .mid b { font: 500 36px var(--mono); }
+  .ring .mid span { font: 10px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+
+  /* bars (largest chats) */
+  .bars { display: flex; align-items: flex-end; gap: 10px; height: 150px; margin-top: auto; }
+  .bars .b { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; min-width: 0; height: 100%; }
+  .bars .b i { display: block; background: var(--sand); transition: height .5s; max-height: calc(100% - 34px); }
+  .bars .b.max i { background: var(--accent); }
+  .bars .b em { font: 10px var(--mono); font-style: normal; color: var(--muted); margin-top: 6px;
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bars .b small { font: 10px var(--mono); color: var(--text); margin-bottom: 4px; white-space: nowrap; }
+
+  /* progress rows (running chats, downloads, accounts) */
+  .rows { display: flex; flex-direction: column; gap: 9px; margin-top: 14px; overflow: hidden; }
+  .rows:empty { display: none; }
+  .pr { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(140px, 2fr) 270px; gap: 14px; align-items: center; }
+  .pr .n { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pr .m { font: 11px var(--mono); color: var(--muted); white-space: nowrap; text-align: right;
+           overflow: hidden; text-overflow: ellipsis; }
+  .pr .meter { margin: 0; height: 5px; }
+  .pr .meter.ind > i { width: 28% !important; animation: slide 1.2s infinite ease-in-out; }
+  .pr .meter.dl > i { background: var(--sand); }
+  @keyframes slide { 0% { left: -28%; } 100% { left: 100%; } }
+  .hint { font: 11px var(--mono); color: var(--muted); }
+  .empty-note { color: var(--dim); font: 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; margin-top: auto; }
+  .q { list-style: none; margin: 14px 0 0; padding: 0; counter-reset: q; }
+  .q li { counter-increment: q; display: flex; gap: 10px; font-size: 12px; padding: 5px 0;
+          border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; }
+  .q li::before { content: counter(q, decimal-leading-zero); font: 11px var(--mono); color: var(--dim); }
+  .q li span { overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .q li em { font: 11px var(--mono); font-style: normal; color: var(--muted); }
+  #log { font: 11px/1.6 var(--mono); color: var(--muted); white-space: pre-wrap; margin: 12px 0 0;
+         max-height: 230px; overflow: auto; }
+  .banner { background: var(--warn); color: var(--sand-ink); font: 12px var(--mono); letter-spacing: .04em;
+            padding: 10px 14px; margin-bottom: 10px; text-transform: uppercase; }
+
+  /* ---------- chats table (Linear-style) ---------- */
+  .tbl-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin: 4px 0 10px; }
+  .tbl-head h1 { font: 600 24px var(--sans); margin: 0; letter-spacing: -.01em; }
+  .tabs { display: flex; gap: 18px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
+  .tabs button { background: none; border: 0; padding: 8px 0; color: var(--muted); font-size: 13px;
+                 border-bottom: 2px solid transparent; margin-bottom: -1px; }
+  .tabs button.on { color: var(--text); border-color: var(--text); }
+  .tabs button em { font-style: normal; color: var(--dim); margin-left: 4px; font-size: 12px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .search { display: flex; align-items: center; gap: 6px; background: var(--tile); border: 1px solid var(--line);
+            padding: 0 9px; flex: 1; min-width: 220px; color: var(--muted); }
+  .search input { background: none; border: 0; outline: 0; padding: 7px 0; flex: 1; color: var(--text); }
+  .sel, .btn { background: var(--tile); border: 1px solid var(--line); padding: 6px 9px; border-radius: 0; }
+  .sel:hover, .btn:hover { border-color: var(--line-2); }
+  .grp { display: flex; align-items: center; gap: 6px; padding-left: 8px; border-left: 1px solid var(--line); }
+  .grp .hint { white-space: nowrap; }
+  .reorder { background: var(--accent-soft); color: var(--accent-2); border: 1px solid var(--accent); padding: 5px 10px; }
+  .tablewrap { overflow: auto; max-height: calc(100vh - 230px); border-top: 1px solid var(--line); }
+  @media (min-height: 420px) {
+    body.chatsv { height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+    body.chatsv .top { position: static; flex: none; }
+    body.chatsv main { flex: 1; min-height: 0; padding: 12px 18px 10px; }
+    body.chatsv #view-chats { height: 100%; display: flex; flex-direction: column; }
+    body.chatsv .tablewrap { flex: 1; min-height: 0; max-height: none; }
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { position: sticky; top: 0; z-index: 5; background: var(--bg); text-align: left; font-weight: 500;
+       color: var(--muted); padding: 9px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; user-select: none; }
+  th[data-sort] { cursor: pointer; } th[data-sort]:hover { color: var(--text); }
+  th .ic { color: var(--dim); margin-right: 5px; font-size: 12px; }
+  th.sorted { color: var(--text); } th.sorted::after { content: " ↓"; } th.sorted.asc::after { content: " ↑"; }
+  td { padding: 7px 8px; border-bottom: 1px solid #1d1d21; white-space: nowrap; vertical-align: middle; }
+  tbody tr:hover td { background: #16161a; }
+  tr.off td:not(.ctl):not(.idx) { opacity: .45; }
+  .idx { color: var(--dim); font: 11px var(--mono); text-align: right; width: 34px; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; } .c { text-align: center; }
+  .chat { display: flex; gap: 10px; align-items: center; min-width: 240px; max-width: 360px; }
+  .chat > div:last-child { min-width: 0; }
+  .av { width: 28px; height: 28px; border-radius: 50%; flex: none; display: grid; place-items: center; position: relative;
+        color: #fff; font: 600 11px var(--sans); overflow: hidden; }
+  .av img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity .2s; }
+  .av img.ok { opacity: 1; }
+  .chat .t { font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+  .chat .s { color: var(--dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 2px 8px;
+          border: 1px solid var(--line-2); background: #1d1d21; color: var(--muted); }
+  .pill::before { content: ""; width: 7px; height: 7px; background: currentColor; }
+  .pill.run { color: #e09a3a; background: #2c2112; border-color: #4a3518; }
+  .pill.queued { color: #8f9bbd; background: #1d2130; border-color: #2e3550; }
+  .pill.wait { color: #d4c13b; background: #2a2712; border-color: #463f17; }
+  .pill.done { color: #4fbf7d; background: #13261b; border-color: #1e3d2a; }
+  .pill.failed { color: #e06b6b; background: #2c1515; border-color: #4a2020; }
+  .prio { display: inline-flex; align-items: center; border: 1px solid var(--line); background: var(--tile); }
+  .prio button { background: none; border: 0; color: var(--muted); padding: 2px 7px; }
+  .prio button:hover { color: var(--text); }
+  .prio input { width: 44px; text-align: center; background: none; border: 0; outline: 0; padding: 3px 0; -moz-appearance: textfield; }
+  .prio input::-webkit-inner-spin-button { -webkit-appearance: none; }
+  input[type=checkbox] { appearance: none; width: 15px; height: 15px; border: 1px solid #4a4a50; background: transparent;
+                         cursor: pointer; display: inline-grid; place-content: center; margin: 0; vertical-align: middle; }
+  input[type=checkbox]:checked { background: var(--text); border-color: var(--text); }
+  input[type=checkbox]:checked::after { content: ""; width: 8px; height: 4px; border: 2px solid var(--sand-ink);
+                                         border-top: 0; border-right: 0; transform: rotate(-45deg) translate(1px, -1px); }
+  .dt { display: inline-flex; align-items: center; gap: 7px; justify-content: flex-end; }
+  .dt .tot { color: var(--dim); } .dt.full .got { color: var(--ok); }
+  .dt .mb { width: 38px; height: 4px; background: #2e2e33; position: relative; }
+  .dt .mb i { position: absolute; inset: 0 auto 0 0; background: var(--muted); }
+  .dt.full .mb i { background: var(--ok); }
+  .muted { color: var(--dim); }
+  .toast { position: fixed; bottom: 18px; right: 18px; background: var(--text); color: var(--sand-ink);
+           font: 12px var(--mono); padding: 9px 14px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 50; }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="logo"><span class="dots"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>tghoard</div>
+  <nav class="nav">
+    <a href="#/dashboard" data-view="dashboard">Dashboard</a>
+    <a href="#/chats" data-view="chats">Chats</a>
+  </nav>
+  <div class="ticker">
+    <div class="tk"><b>Status</b><span id="tkPhase">—</span></div>
+    <div class="tk"><b>Accounts</b><span id="tkAccounts">—</span></div>
+    <div class="tk"><b>Selected chats</b><span id="tkChats">—</span></div>
+    <div class="tk"><b>Archived messages</b><span id="tkMsgs">—</span></div>
+    <div class="tk"><b>Archive size</b><span id="tkSize">—</span></div>
+    <div class="tk"><b>Speed</b><span id="tkSpeed">—</span></div>
+    <div class="tk"><b>FloodWaits</b><span id="tkFloods">—</span></div>
+  </div>
+  <button id="startBtn" class="cta" hidden>▶ Start sync</button>
+</header>
+
+<main>
+  <!-- ================= DASHBOARD ================= -->
+  <section id="view-dashboard" class="view" hidden>
+    <div class="banner float" id="waitBanner" hidden>No chats to sync — select chats in the Chats tab and click Start sync (or press Enter in the terminal)</div>
+    <div class="grid">
+      <div class="tile accent c3" data-area="chats">
+        <div class="lbl">Chats this run <span class="kebab">⋮</span></div>
+        <div class="bigrow"><div class="big" id="dChatsDone">0</div><div class="suffix" id="dChatsTotal">/ 0</div></div>
+      </div>
+      <div class="tile c3" data-area="msgs">
+        <div class="lbl">Messages saved <span class="kebab">⋮</span></div>
+        <div class="bigrow"><div class="big md" id="dMsgs">0</div><div class="suffix">this run</div></div>
+      </div>
+      <div class="tile c6 r2" data-area="speed">
+        <div class="lbl">Download speed
+          <div class="chips" id="speedWin">
+            <button data-win="60">1M</button><button data-win="300" class="on">5M</button>
+            <button data-win="900">15M</button><button data-win="1800">30M</button>
+          </div>
+        </div>
+        <div class="bigrow" style="margin-top:14px"><div class="big" id="dSpeed">0</div><div class="suffix" id="dSpeedUnit">MB/s</div></div>
+        <div class="chart" id="chart"><div class="plot" id="plot">
+          <svg viewBox="0 0 600 200" preserveAspectRatio="none" id="chartSvg">
+            <defs><linearGradient id="grad" x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0" stop-color="#7088b8" stop-opacity=".35"/><stop offset="1" stop-color="#7088b8" stop-opacity="0"/>
+            </linearGradient></defs>
+            <g id="chartGrid"></g><path class="ar" id="chartArea"/><path class="ln" id="chartLine"/>
+          </svg>
+          <div class="cur" id="chartCur" hidden></div><div class="tip" id="chartTip" hidden></div>
+          <div class="empty" id="chartEmpty">no downloads yet</div>
+        </div><div id="chartLabels"></div></div>
+        <div class="foot"><span>avg <b id="dSpeedAvg">—</b></span><span>peak <b id="dSpeedPeak">—</b></span><span>downloaded <b id="dBytes">—</b></span></div>
+      </div>
+      <div class="tile c3" data-area="files">
+        <div class="lbl">Media downloaded <span class="kebab">⋮</span></div>
+        <div class="bigrow"><div class="big md" id="dFiles">0</div><div class="suffix" id="dFilesQ">queue 0</div></div>
+      </div>
+      <div class="tile c3" data-area="pool">
+        <div class="lbl">Download pool <span class="kebab">⋮</span></div>
+        <div class="bigrow"><div class="big md" id="dPool">0</div><div class="suffix" id="dPoolMax">/ 0</div></div>
+        <div class="meter"><i id="dPoolBar" style="width:0%"></i></div>
+      </div>
+
+      <div class="tile c2" data-area="ring">
+        <div class="lbl">Progress</div>
+        <div class="ringwrap"><div class="ring">
+          <svg viewBox="0 0 180 180"><circle class="bg" cx="90" cy="90" r="78" fill="none" stroke-width="6"/>
+            <circle class="fg" id="ringFg" cx="90" cy="90" r="78" fill="none" stroke-width="6" stroke-dasharray="490.1" stroke-dashoffset="490.1"/></svg>
+          <div class="mid"><b id="ringPct">0%</b><span id="ringLbl">chats</span></div>
+        </div></div>
+      </div>
+      <div class="tile c2" data-area="thr">
+        <div class="lbl">Throttle <span class="kebab">⋮</span></div>
+        <div class="bigrow"><div class="big md" id="dPause">0.00</div><div class="suffix">s/page</div></div>
+        <div class="foot"><span>flood <b id="dFloods">0</b></span><span><b id="dLimit">—</b></span></div>
+      </div>
+      <div class="tile c5" data-area="bars">
+        <div class="lbl">Largest chats <span class="sub">size in archive</span></div>
+        <div class="bars" id="bars"></div>
+      </div>
+      <div class="tile sand c3" data-area="sync">
+        <div class="lbl">Sync <button class="arrow" id="sandBtn" title="Start sync">↗</button></div>
+        <div class="sandtitle" id="sandTitle">Edit<br>only</div>
+        <div class="lbl"><span id="sandSub">tghoard web</span></div>
+      </div>
+
+      <div class="tile c5" data-area="run">
+        <div class="lbl">In progress <span class="sub" id="dRunCount"></span></div>
+        <div class="rows" id="dAccounts"></div>
+        <div class="runbox"><div class="rows" id="dRunning"></div><div class="rows" id="dDownloads"></div></div>
+        <div class="empty-note" id="dRunEmpty">no sync in progress</div>
+      </div>
+      <div class="tile c3" data-area="queue">
+        <div class="lbl">Up next <span class="sub">priority</span></div>
+        <ol class="q" id="dQueue"></ol>
+        <div class="empty-note" id="dQueueEmpty">queue empty</div>
+      </div>
+      <div class="tile c4" data-area="log">
+        <div class="lbl">Log <span class="sub" id="dPhaseMsg"></span></div>
+        <pre id="log"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= CHATS TABLE ================= -->
+  <section id="view-chats" class="view" hidden>
+    <div class="tbl-head"><h1>Chats</h1><span class="hint" id="manifestPath"></span></div>
+    <div class="tabs" id="tabs">
+      <button data-filter="" class="on">All <em id="cntAll"></em></button>
+      <button data-filter="on">Selected <em id="cntOn"></em></button>
+      <button data-filter="off">Not selected <em id="cntOff"></em></button>
+      <button data-filter="active">Queued / syncing <em id="cntActive"></em></button>
+    </div>
+    <div class="toolbar">
+      <label class="search">⌕ <input id="q" type="search" placeholder="Search by title, @username or chat_key…"></label>
+      <select id="section" class="sel"><option value="">All sections</option></select>
+      <select id="folder" class="sel" hidden title="Telegram folders"><option value="">All folders</option></select>
+      <button class="reorder" id="reorderBtn" hidden title="The data changed since the last sort">↻ Re-sort</button>
+      <div class="grp">
+        <span class="hint">apply to <b id="visibleCount">0</b> visible</span>
+        <select id="bulkField" class="sel">
+          <option value="baixar">download</option><option value="photos">photos</option>
+          <option value="videos">videos</option><option value="audio">audio</option><option value="files">files</option>
+        </select>
+        <button class="btn" data-bulk="1">Check</button><button class="btn" data-bulk="0">Uncheck</button>
+      </div>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr id="heads">
+          <th class="idx">#</th>
+          <th data-sort="title"><span class="ic">Aa</span>Chat</th>
+          <th data-sort="status"><span class="ic">◌</span>Status</th>
+          <th class="c" data-sort="priority" title="Higher syncs first"><span class="ic">⇅</span>Priority</th>
+          <th class="c" data-sort="baixar" title="Download this chat (the &quot;baixar&quot; checkbox in chats.md)">download</th><th class="c" data-sort="photos_on">photos</th>
+          <th class="c" data-sort="videos_on">videos</th><th class="c" data-sort="audio_on">audio</th>
+          <th class="c" data-sort="files_on">files</th>
+          <th class="num" data-sort="messages" title="downloaded / total on Telegram (sorts by total)">Messages</th>
+          <th class="num" data-sort="photos" title="downloaded / total (sorts by total)">Photos</th>
+          <th class="num" data-sort="videos" title="downloaded / total (sorts by total)">Videos</th>
+          <th class="num" data-sort="audio" title="downloaded / total (sorts by total)">Audio</th>
+          <th class="num" data-sort="files" title="downloaded / total (sorts by total)">Files</th>
+          <th class="num" data-sort="links">Links</th>
+          <th class="num" data-sort="size">Size</th>
+          <th data-sort="period"><span class="ic">▦</span>Period</th>
+          <th data-sort="joined" title="When you joined"><span class="ic">▦</span>Joined</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<div id="toast" class="toast"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const FLAGS = ["baixar", "photos", "videos", "audio", "files"];
+const REMOTE_KEYS = ["messages", "photos", "videos", "audio", "files"];
+const state = {
+  chats: new Map(), rows: new Map(), order: [], status: null, logSince: null, sections: [],
+  folders: new Map(), inAnyFolder: new Set(), live: new Map(), canFetch: false,
+  filter: "", sort: { key: "priority", dir: -1 }, speedWin: 300, view: "dashboard",
+};
+
+// ---------- formatting / dom ----------
+const fmtNum = (n) => (n || 0).toLocaleString("en-US");
+function fmtCompact(n) {
+  if (n == null) return "?";
+  if (n < 10000) return n.toLocaleString("en-US");
+  return Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(n);
+}
+function fmtBytes(n) {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
+}
+function fmtSpeed(bps) {  // -> [value, unit]
+  if (bps >= 1048576) return [(bps / 1048576).toFixed(bps >= 10485760 ? 1 : 2), "MB/s"];
+  if (bps >= 1024) return [(bps / 1024).toFixed(0), "KB/s"];
+  return [Math.round(bps || 0).toString(), "B/s"];
+}
+function fmtDur(s) {
+  if (s == null || !isFinite(s) || s < 0) return "—";
+  s = Math.round(s);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+}
+function el(tag, attrs = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v; else if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v);
+  }
+  for (const k of kids) if (k != null) e.append(k);
+  return e;
+}
+function setText(id, v) { const n = $(id); if (n.textContent !== String(v)) n.textContent = v; }
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), 2200);
+}
+function hue(str) {
+  let h = 0x811c9dc5;
+  for (const c of str) { h ^= c.charCodeAt(0); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h % 360;
+}
+function initials(title) {
+  const w = title.replace(/[^\p{L}\p{N} ]/gu, " ").trim().split(/\s+/);
+  return ((w[0] || "?")[0] + (w[1] ? w[1][0] : "")).toUpperCase();
+}
+async function api(path, body) {
+  const opt = body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Tghoard": "1" }, body: JSON.stringify(body),
+  };
+  const r = await fetch(path, opt);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+// ---------- router: two screens, switched without reloading the page ----------
+function route() {
+  const view = location.hash.replace("#/", "") === "chats" ? "chats" : "dashboard";
+  state.view = view;
+  $("view-dashboard").hidden = view !== "dashboard";
+  $("view-chats").hidden = view !== "chats";
+  document.querySelectorAll(".nav a").forEach((a) => a.classList.toggle("on", a.dataset.view === view));
+  document.body.classList.toggle("dash", view === "dashboard");
+  document.body.classList.toggle("chatsv", view === "chats");
+}
+window.addEventListener("hashchange", route);
+
+// ---------- dashboard ----------
+function eta(completed, total, startedAt, now) {
+  if (!total || !completed || !startedAt) return null;
+  return (total - completed) / (completed / Math.max(1, now - startedAt));
+}
+function prow(label, completed, total, meta, cls = "") {
+  const pct = total ? Math.min(100, (100 * completed) / total) : 0;
+  return el("div", { class: "pr" }, el("div", { class: "n", text: label, title: label }),
+    el("div", { class: `meter ${cls} ${total ? "" : "ind"}` }, el("i", { style: `width:${pct}%` })),
+    el("div", { class: "m", text: meta }));
+}
+
+function renderStatus(s) {
+  state.status = s;
+  const phase = s.phase || "offline";
+  const labels = { offline: "edit only", idle: "idle", connecting: "connecting",
+                   waiting_user: "waiting for you", running: "syncing", done: "done" };
+  const tk = $("tkPhase");
+  tk.textContent = labels[phase] || phase;
+  tk.className = phase === "running" ? "run" : phase === "done" ? "ok" : phase === "waiting_user" ? "warn" : "";
+  $("startBtn").hidden = !(phase === "waiting_user" || phase === "done");
+  $("startBtn").textContent = phase === "done" ? "↻ Sync again" : "▶ Start sync";
+  $("waitBanner").hidden = phase !== "waiting_user";
+  const now = s.now || Date.now() / 1000;
+  const accts = s.accounts || [];
+  const floods = accts.reduce((a, x) => a + (x.floods || 0), 0);
+  setText("tkAccounts", phase === "offline" ? "—" : accts.length || "—");
+  setText("tkFloods", phase === "offline" ? "—" : floods);
+
+  // number tiles
+  const done = accts.reduce((a, x) => a + (x.completed || 0), 0);
+  const total = accts.reduce((a, x) => a + (x.total || 0), 0);
+  setText("dChatsDone", fmtNum(done)); setText("dChatsTotal", `/ ${fmtNum(total)}`);
+  setText("dMsgs", fmtCompact(s.messages_total || 0));
+  setText("dFiles", fmtCompact(s.files_total || 0));
+  const dlActive = accts.reduce((a, x) => a + (x.dl_active || 0), 0);
+  const dlLimit = accts.reduce((a, x) => a + (x.dl_limit || 0), 0);
+  const dlQueued = accts.reduce((a, x) => a + (x.dl_queued || 0), 0);
+  const qMax = accts.reduce((a, x) => a + (x.dl_queue_max || 0), 0);
+  setText("dFilesQ", qMax ? `queue ${fmtNum(dlQueued)} / ${fmtNum(qMax)}` : `queue ${fmtNum(dlQueued)}`);
+  setText("dPool", dlActive); setText("dPoolMax", `/ ${dlLimit}`);
+  $("dPoolBar").style.width = `${dlLimit ? (100 * dlActive) / dlLimit : 0}%`;
+  const pauses = accts.map((a) => parseFloat(((a.pace || "").match(/(?:pausa|pause) ([\d.]+)s/) || [])[1] || "0"));
+  setText("dPause", (pauses.length ? Math.max(...pauses) : 0).toFixed(2));
+  setText("dFloods", floods); setText("dLimit", dlLimit ? `${dlLimit} downloads` : "—");
+  const pct = total ? Math.round((100 * done) / total) : 0;
+  $("ringFg").style.strokeDashoffset = String(490.1 * (1 - pct / 100));
+  setText("ringPct", `${pct}%`);
+  setText("ringLbl", total ? `${done} of ${total} chats` : "no run");
+
+  // download speed
+  const [sv, su] = fmtSpeed(s.speed_now || 0);
+  setText("dSpeed", sv); setText("dSpeedUnit", su);
+  setText("tkSpeed", phase === "running" ? `${sv} ${su}` : "—");
+  setText("dBytes", fmtBytes(s.bytes_total || 0));
+  state.speed = s.speed || []; state.speedNow = now;
+  drawChart();
+
+  // accounts / running chats / downloads
+  const accBox = $("dAccounts"); accBox.replaceChildren();
+  for (const a of accts) {
+    const left = eta(a.completed, a.total, a.started_at, now);
+    accBox.append(prow(`👤 ${a.alias}`, a.completed, a.total,
+      `${fmtNum(a.completed)}/${a.total == null ? "?" : fmtNum(a.total)} chats · ETA ${fmtDur(left)}`));
+    if (a.pace) accBox.append(el("div", { class: "hint", text: `⚙ ${a.pace}` }));
+  }
+  const run = $("dRunning"); run.replaceChildren();
+  for (const c of s.running || []) {
+    if (c.status === "waiting_lock") { run.append(prow(c.title, 0, null, "waiting for another account")); continue; }
+    const left = eta(c.completed, c.total, c.started_at, now);
+    const p = c.total ? ` ${Math.floor((100 * c.completed) / c.total)}%` : "";
+    run.append(prow(c.title, c.completed, c.total,
+      `${fmtCompact(c.completed)}/${c.total == null ? "?" : fmtCompact(c.total)} ${c.unit}${p} · ETA ${fmtDur(left)}`));
+  }
+  const dls = $("dDownloads"); dls.replaceChildren();
+  for (const d of s.downloads || []) {
+    const speed = d.completed / Math.max(0.5, now - d.started_at);
+    dls.append(prow(`⬇ ${d.label}`, d.completed, d.total,
+      `${fmtBytes(d.completed)}/${fmtBytes(d.total)} · ${fmtSpeed(speed).join(" ")}`, "dl"));
+  }
+  setText("dRunCount", (s.running || []).length ? `${(s.running || []).length} chats` : "");
+  $("dRunEmpty").hidden = !!(accts.length || (s.running || []).length);
+  const q = $("dQueue"); q.replaceChildren();
+  for (const c of (s.queued || []).slice(0, 8))
+    q.append(el("li", {}, el("span", { text: c.title }), el("em", { text: `p${c.priority}` })));
+  $("dQueueEmpty").hidden = (s.queued || []).length > 0;
+  setText("dPhaseMsg", s.message || "");
+
+  // sand call-to-action tile
+  const sand = { offline: ["Edit<br>only", "tghoard web · offline"], running: ["Sync-<br>ing", `${pct}% of chats`],
+                 done: ["Sync<br>done", "↗ run again"], waiting_user: ["Wait-<br>ing", "↗ start sync"] }[phase]
+               || ["Connect-<br>ing", ""];
+  if ($("sandTitle").innerHTML !== sand[0]) $("sandTitle").innerHTML = sand[0];
+  setText("sandSub", sand[1]);
+  $("sandBtn").hidden = !(phase === "waiting_user" || phase === "done");
+
+  // log
+  const log = $("log");
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
+  for (const e of s.log || []) {
+    log.append(`${new Date(e.t * 1000).toLocaleTimeString("en-US")} ${e.msg}\n`);
+    state.logSince = e.t;
+  }
+  while (log.childNodes.length > 600) log.removeChild(log.firstChild);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+
+  // live status badges for the table (updated in place)
+  const live = new Map();
+  (s.queued || []).forEach((c, i) => live.set(c.chat_key, { ...c, pos: i + 1 }));
+  for (const c of [...(s.finished || []), ...(s.running || [])]) live.set(c.chat_key, c);
+  state.live = live;
+  for (const [key, tr] of state.rows) updateBadge(tr, live.get(key));
+  setText("cntActive", [...live.values()].filter((c) => ["queued", "running", "waiting_lock"].includes(c.status)).length || "");
+}
+
+// download-speed line chart (plain SVG)
+function niceMax(bps) {  // round axis maximum in the unit it will be shown in (KB/s or MB/s)
+  const unit = bps >= 1048576 ? 1048576 : 1024, v = bps / unit;
+  const p = Math.pow(10, Math.floor(Math.log10(v))), n = v / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 4 ? 4 : n <= 8 ? 8 : 10) * p * unit;
+}
+function svgEl(tag, attrs) {
+  const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+}
+function drawChart() {
+  const now = state.speedNow || Date.now() / 1000, win = state.speedWin, W = 600, H = 200;
+  const pts = (state.speed || []).filter((p) => p[0] >= now - win);
+  const vals = pts.map((p) => p[1]);
+  $("chartEmpty").hidden = vals.some((v) => v > 0);
+  const max = niceMax(Math.max(1024, ...vals) * 1.1);
+  const x = (t) => ((t - (now - win)) / win) * W, y = (v) => H - (v / max) * H;
+  const grid = $("chartGrid"), labels = $("chartLabels");
+  grid.replaceChildren(); labels.replaceChildren();
+  for (let i = 1; i <= 4; i++) {
+    const v = (max * i) / 4, yy = y(v);
+    grid.append(svgEl("line", { x1: 0, x2: W, y1: yy, y2: yy, class: "gl" }));
+    labels.append(el("div", { class: "ylab", style: `top:${(yy / H) * 100}%`, text: fmtSpeed(v).join(" ") }));
+  }
+  if (pts.length < 2) { $("chartLine").setAttribute("d", ""); $("chartArea").setAttribute("d", ""); }
+  else {
+    const d = pts.map((p, i) => `${i ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join(" ");
+    $("chartLine").setAttribute("d", d);
+    $("chartArea").setAttribute("d", `${d} L${x(pts[pts.length - 1][0]).toFixed(1)},${H} L${x(pts[0][0]).toFixed(1)},${H} Z`);
+  }
+  const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+  setText("dSpeedAvg", fmtSpeed(avg).join(" ")); setText("dSpeedPeak", fmtSpeed(Math.max(0, ...vals)).join(" "));
+  state.chartPts = pts; state.chartGeo = { max, win, now };
+}
+$("plot").addEventListener("mousemove", (ev) => {
+  const pts = state.chartPts || []; if (!pts.length) return;
+  const box = $("plot").getBoundingClientRect(), { win, now, max } = state.chartGeo;
+  const t = now - win + ((ev.clientX - box.left) / box.width) * win;
+  let best = pts[0]; for (const p of pts) if (Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p;
+  const px = ((best[0] - (now - win)) / win) * 100, py = (1 - best[1] / max) * 100;
+  const cur = $("chartCur"), tip = $("chartTip");
+  cur.hidden = tip.hidden = false; cur.style.left = `${px}%`; tip.style.left = `${px}%`; tip.style.top = `${py}%`;
+  tip.textContent = `${fmtSpeed(best[1]).join(" ")} · ${new Date(best[0] * 1000).toLocaleTimeString("en-US")}`;
+});
+$("plot").addEventListener("mouseleave", () => { $("chartCur").hidden = $("chartTip").hidden = true; });
+document.querySelectorAll("#speedWin button").forEach((b) => b.addEventListener("click", () => {
+  state.speedWin = +b.dataset.win;
+  document.querySelectorAll("#speedWin button").forEach((x) => x.classList.toggle("on", x === b));
+  drawChart();
+}));
+
+function renderArchiveStats() {
+  const all = [...state.chats.values()];
+  const on = all.filter((c) => c.baixar).length;
+  setText("tkChats", `${fmtNum(on)} / ${fmtNum(all.length)}`);
+  setText("tkMsgs", fmtCompact(all.reduce((a, c) => a + c.stats.messages, 0)));
+  setText("tkSize", fmtBytes(all.reduce((a, c) => a + c.stats.total_bytes, 0)));
+  setText("cntAll", all.length || ""); setText("cntOn", on || ""); setText("cntOff", (all.length - on) || "");
+  const top = all.filter((c) => c.stats.total_bytes > 0).sort((a, b) => b.stats.total_bytes - a.stats.total_bytes).slice(0, 7);
+  const sig = top.map((c) => `${c.chat_key}:${c.stats.total_bytes}`).join(",");
+  const bars = $("bars");
+  if (bars._sig === sig) return;
+  bars._sig = sig; bars.replaceChildren();
+  const max = top.length ? top[0].stats.total_bytes : 1;
+  top.forEach((c, i) => bars.append(el("div", { class: `b${i === 0 ? " max" : ""}`, title: `${c.title}: ${fmtBytes(c.stats.total_bytes)}` },
+    i === 0 ? el("small", { text: fmtBytes(c.stats.total_bytes) }) : null,
+    el("i", { style: `height:${Math.max(4, (100 * c.stats.total_bytes) / max)}%` }), el("em", { text: c.title }))));
+  if (!top.length) bars.append(el("div", { class: "empty-note", text: "archive empty" }));
+}
+
+// ---------- chats table ----------
+function updateBadge(tr, c) {
+  const td = tr._badge;
+  const sig = c ? `${c.status}|${c.completed}|${c.total}|${c.pos}|${c.messages_saved}` : "-";
+  if (td._sig === sig) return;
+  td._sig = sig; td.replaceChildren();
+  if (!c) { td.append(el("span", { class: "muted", text: "—" })); return; }
+  const pct = c.total ? Math.floor((100 * c.completed) / c.total) : null;
+  const [cls, label] = {
+    running: ["run", pct == null ? "Syncing" : `Syncing ${pct}%`],
+    queued: ["queued", `Queued #${c.pos}`], waiting_lock: ["wait", "Waiting"],
+    done: ["done", `Done +${fmtNum(c.messages_saved)}`], failed: ["failed", "Failed"],
+  }[c.status] || ["", c.status];
+  td.append(el("span", { class: `pill ${cls}`, text: label, title: c.error || "" }));
+}
+
+function createRow(c) {
+  const av = el("div", { class: "av", style: `background:hsl(${hue(c.chat_key)} 38% 40%)` }, initials(c.title));
+  const img = el("img", { alt: "" });
+  img.addEventListener("load", () => img.classList.add("ok"));
+  av.append(img);
+  av._img = img; av._src = c.avatar; av._tries = 0; av._state = "idle";
+  const title = el("div", { class: "t" }), sub = el("div", { class: "s" });
+  const tr = el("tr", {});
+  tr._idx = el("td", { class: "idx" }); tr.append(tr._idx);
+  tr.append(el("td", {}, el("div", { class: "chat" }, av, el("div", {}, title, sub))));
+  tr._title = title; tr._sub = sub; tr._av = av;
+  tr._badge = el("td", {}); tr.append(tr._badge);
+  const input = el("input", { type: "number", min: "-99", max: "999", step: "1" });
+  input.addEventListener("change", () => save(c.chat_key, { priority: parseInt(input.value || "0", 10) }));
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") input.blur(); });
+  const step = (d) => () => { input.value = parseInt(input.value || "0", 10) + d; input.dispatchEvent(new Event("change")); };
+  tr._prio = input;
+  tr.append(el("td", { class: "c ctl" }, el("span", { class: "prio" },
+    el("button", { onclick: step(-1), title: "decrease" }, "−"), input, el("button", { onclick: step(1), title: "increase" }, "+"))));
+  tr._boxes = {};
+  for (const f of FLAGS) {
+    const cb = el("input", { type: "checkbox", title: f === "baixar" ? "download" : f });
+    cb.addEventListener("change", () => save(c.chat_key, { [f]: cb.checked }));
+    tr._boxes[f] = cb; tr.append(el("td", { class: "c ctl" }, cb));
+  }
+  tr._cells = {};
+  for (const k of [...REMOTE_KEYS, "links", "size"]) { tr._cells[k] = el("td", { class: "num" }); tr.append(tr._cells[k]); }
+  tr._period = el("td", { class: "muted" }); tr.append(tr._period);
+  tr._joined = el("td", { class: "muted" }); tr.append(tr._joined);
+  return tr;
+}
+
+// "downloaded / total on Telegram" cell with a mini bar
+function setDT(td, got, total, extra) {
+  got = got || 0;
+  const pct = total ? Math.min(100, Math.floor((100 * got) / total)) : 0;
+  const sig = `${got}|${total}`;
+  if (td._sig !== sig) {
+    td._sig = sig;
+    td.replaceChildren(el("span", { class: `dt${total != null && total > 0 && got >= total ? " full" : ""}` },
+      el("span", { class: "got", text: fmtCompact(got) }), el("span", { class: "tot", text: `/ ${fmtCompact(total)}` }),
+      el("span", { class: "mb" }, el("i", { style: `width:${total ? pct : 0}%` }))));
+  }
+  td.title = total == null ? `${fmtNum(got)} downloaded · total on Telegram unknown · ${extra}`
+                           : `${fmtNum(got)} of ${fmtNum(total)} (${pct}%) · ${extra}`;
+}
+
+function updateRow(tr, c) {
+  const st = c.stats, remote = c.remote || {};
+  setNodeText(tr._title, c.title);
+  setNodeText(tr._sub, [c.username ? "@" + c.username : null, c.chat_key].filter(Boolean).join(" · "));
+  if (document.activeElement !== tr._prio && tr._prio.value !== String(c.priority)) tr._prio.value = c.priority;
+  for (const f of FLAGS) if (tr._boxes[f].checked !== !!c[f]) tr._boxes[f].checked = !!c[f];
+  tr.classList.toggle("off", !c.baixar);
+  setDT(tr._cells.messages, st.messages, remote.messages, st.deleted ? `${fmtNum(st.deleted)} deleted (preserved)` : "messages");
+  for (const cat of ["photos", "videos", "audio", "files"]) setDT(tr._cells[cat], st.media_counts[cat], remote[cat], fmtBytes(st.media_bytes[cat]));
+  setNodeText(tr._cells.links, fmtNum(st.links));
+  setNodeText(tr._cells.size, st.total_bytes ? fmtBytes(st.total_bytes) : "—");
+  setNodeText(tr._period, st.first_month ? (st.first_month === st.last_month ? st.first_month : `${st.first_month} → ${st.last_month}`) : "—");
+  setNodeText(tr._joined, st.joined_at ? new Date(st.joined_at).toLocaleDateString("en-US") : "—");
+  tr._joined.title = (st.joined || []).map((j) => `${j.account || "?"}: ${new Date(j.joined_at).toLocaleString("en-US")}`
+    + (j.inviter_id ? ` (invited by ${j.inviter_id})` : "")).join("\n");
+  observeRow(tr, c.chat_key);
+}
+function setNodeText(node, v) { if (node.textContent !== v) node.textContent = v; }
+
+// lazy chat photo + Telegram totals, shared slow queue (max 3 in flight)
+const slow = { active: 0, max: 3, queue: [] };
+function enqueue(task) { slow.queue.push(task); pumpSlow(); }
+function pumpSlow() {
+  while (slow.active < slow.max && slow.queue.length) {
+    const task = slow.queue.shift(); slow.active++;
+    Promise.resolve().then(task).catch(() => {}).finally(() => { slow.active--; pumpSlow(); });
+  }
+}
+const AVATAR_RETRY_MS = [10000, 30000, 90000, 300000];
+function loadAvatar(av) {
+  if (av._state !== "idle") return;
+  av._state = "busy";
+  enqueue(() => new Promise((done) => {
+    const img = av._img;
+    const finish = (ok) => {
+      img.onload = img.onerror = null;
+      if (ok) { av._state = "ok"; return done(); }
+      if (state.canFetch && av._tries < AVATAR_RETRY_MS.length) {
+        av._state = "wait";
+        setTimeout(() => { av._state = "idle"; loadAvatar(av); }, AVATAR_RETRY_MS[av._tries]);
+      } else av._state = "gave_up";
+      done();
+    };
+    img.onload = () => finish(true); img.onerror = () => finish(false);
+    img.src = av._tries++ ? `${av._src}?retry=${av._tries}` : av._src;
+  }));
+}
+const countsAsked = new Set();
+function loadCounts(key) {
+  if (!state.canFetch || countsAsked.has(key) || state.chats.get(key)?.remote) return;
+  countsAsked.add(key);
+  const retryLater = () => setTimeout(() => countsAsked.delete(key), 30000);
+  enqueue(() => api(`/api/counts/${key}`).then((r) => {
+    const c = state.chats.get(key);
+    if (!(c && r.remote)) return retryLater();
+    c.remote = r.remote;
+    const tr = state.rows.get(key);
+    if (tr) {
+      updateRow(tr, c);
+      if (tr._av._state === "wait" || tr._av._state === "gave_up") { tr._av._state = "idle"; loadAvatar(tr._av); }
+    }
+    if (REMOTE_KEYS.includes(state.sort.key)) markStale();
+  }, retryLater));
+}
+const rowObserver = new IntersectionObserver((entries) => {
+  for (const e of entries) if (e.isIntersecting) { loadAvatar(e.target._av); loadCounts(e.target.dataset.key); }
+}, { rootMargin: "300px" });
+function observeRow(tr, key) { if (!tr._observed) { tr._observed = true; tr.dataset.key = key; rowObserver.observe(tr); } }
+
+// Filtering + sorting. Rows are re-ordered ONLY on explicit user actions (column sort, tabs,
+// filters, search, "Re-sort"). Background refreshes and cell edits update values in place,
+// so the row being edited never jumps, loses focus or closes its controls.
+const NO_FOLDER = "__none__";
+const ASC_FIRST = new Set(["title", "period", "joined"]);
+const STATUS_ORDER = { running: 0, waiting_lock: 1, queued: 2, failed: 3, done: 4 };
+function sortValue(c, key) {
+  const live = state.live.get(c.chat_key);
+  switch (key) {
+    case "title": return c.title.toLocaleLowerCase("en-US");
+    case "status": return live ? -(STATUS_ORDER[live.status] ?? 9) : null;
+    case "priority": return c.priority;
+    case "baixar": return c.baixar ? 1 : 0;
+    case "photos_on": case "videos_on": case "audio_on": case "files_on": return c[key.slice(0, -3)] ? 1 : 0;
+    case "messages": case "photos": case "videos": case "audio": case "files": return c.remote?.[key] ?? null;
+    case "links": return c.stats.links;
+    case "size": return c.stats.total_bytes;
+    case "period": return c.stats.last_month;
+    case "joined": return c.stats.joined_at;
+  }
+  return null;
+}
+function compareChats(a, b) {
+  const { key, dir } = state.sort;
+  const va = sortValue(a, key), vb = sortValue(b, key);
+  if (va == null || vb == null) { if (va != null) return -1; if (vb != null) return 1; }
+  else if (va !== vb) return (typeof va === "string" ? va.localeCompare(vb, "en-US") : va - vb) * dir;
+  return b.priority - a.priority || a.title.localeCompare(b.title, "en-US");
+}
+function matches(c) {
+  const q = $("q").value.trim().toLowerCase(), sec = $("section").value, fsel = $("folder").value;
+  if (sec && c.section !== sec) return false;
+  if (fsel === NO_FOLDER ? state.inAnyFolder.has(c.chat_key) : (fsel && !state.folders.get(fsel)?.has(c.chat_key))) return false;
+  if (state.filter === "on" && !c.baixar) return false;
+  if (state.filter === "off" && c.baixar) return false;
+  if (state.filter === "active" && !["queued", "running", "waiting_lock"].includes(state.live.get(c.chat_key)?.status)) return false;
+  if (q && !`${c.title} ${c.username || ""} ${c.chat_key}`.toLowerCase().includes(q)) return false;
+  return true;
+}
+function computeOrder() { return [...state.chats.values()].filter(matches).sort(compareChats).map((c) => c.chat_key); }
+function reorder() {
+  state.order = computeOrder();
+  $("reorderBtn").hidden = true;
+  const body = $("rows"), keep = new Set(state.order);
+  for (const [key, tr] of state.rows) if (!keep.has(key)) tr.remove();
+  state.order.forEach((key, i) => {
+    let tr = state.rows.get(key);
+    const c = state.chats.get(key);
+    if (!tr) { tr = createRow(c); state.rows.set(key, tr); updateBadge(tr, state.live.get(key)); }
+    updateRow(tr, c);
+    setNodeText(tr._idx, String(i + 1));
+    if (body.children[i] !== tr) body.insertBefore(tr, body.children[i] || null);  // only move if needed
+  });
+  setText("visibleCount", state.order.length);
+  renderSortHeads();
+}
+function refreshInPlace() {  // background refresh: update values, never move rows
+  for (const key of state.order) { const tr = state.rows.get(key), c = state.chats.get(key); if (tr && c) updateRow(tr, c); }
+  markStale();
+}
+function markStale() {  // offer "Re-sort" when the current order no longer matches the data
+  clearTimeout(markStale._t);
+  markStale._t = setTimeout(() => {
+    const fresh = computeOrder();
+    $("reorderBtn").hidden = fresh.length === state.order.length && fresh.every((k, i) => k === state.order[i]);
+  }, 300);
+}
+function renderSortHeads() {
+  for (const th of document.querySelectorAll("#heads th[data-sort]")) {
+    const on = th.dataset.sort === state.sort.key;
+    th.classList.toggle("sorted", on); th.classList.toggle("asc", on && state.sort.dir === 1);
+  }
+}
+document.querySelectorAll("#heads th[data-sort]").forEach((th) => th.addEventListener("click", () => {
+  const key = th.dataset.sort;
+  state.sort = state.sort.key === key ? { key, dir: -state.sort.dir } : { key, dir: ASC_FIRST.has(key) ? 1 : -1 };
+  reorder();
+}));
+document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => {
+  state.filter = b.dataset.filter;
+  document.querySelectorAll("#tabs button").forEach((x) => x.classList.toggle("on", x === b));
+  reorder();
+}));
+for (const id of ["q", "section", "folder"]) $(id).addEventListener("input", reorder);
+$("reorderBtn").addEventListener("click", reorder);
+
+function renderFolderOptions(folders) {
+  const sel = $("folder"), current = sel.value;
+  state.folders = new Map(folders.map((f) => [f.key, new Set(f.members)]));
+  state.inAnyFolder = new Set(folders.flatMap((f) => f.members));
+  const noFolder = [...state.chats.keys()].filter((k) => !state.inAnyFolder.has(k)).length;
+  const sig = JSON.stringify([folders.map((f) => [f.key, f.label, f.members.length]), noFolder]);
+  if (sel._sig === sig) return;
+  sel._sig = sig;
+  sel.replaceChildren(el("option", { value: "", text: "All folders" }),
+    el("option", { value: NO_FOLDER, text: `📭 No folder · ${noFolder}` }),
+    ...folders.map((f) => el("option", { value: f.key, text: `${f.label} · ${f.members.length}` })));
+  sel.value = current === NO_FOLDER || state.folders.has(current) ? current : "";
+  sel.hidden = folders.length === 0;
+}
+
+async function save(chatKey, fields) {
+  const c = state.chats.get(chatKey), before = { ...c };
+  Object.assign(c, fields);
+  state.editedAt = Date.now();
+  const tr = state.rows.get(chatKey);
+  if (tr) updateRow(tr, c);
+  renderArchiveStats();
+  try {
+    const r = await api("/api/chats", { updates: { [chatKey]: fields } });
+    Object.assign(c, r.chats[chatKey] || {});
+    if (tr) updateRow(tr, c);
+    markStale();
+  } catch (e) {
+    Object.assign(c, before); if (tr) updateRow(tr, c); renderArchiveStats();
+    toast(`Failed to save: ${e.message}`);
+  }
+}
+async function bulk(value) {
+  const field = $("bulkField").value, label = $("bulkField").selectedOptions[0].text, keys = state.order;
+  if (!keys.length) return;
+  if (keys.length > 20 && !confirm(`${value ? "Check" : "Uncheck"} "${label}" on ${keys.length} chats?`)) return;
+  try {
+    state.editedAt = Date.now();
+    const r = await api("/api/chats", { updates: Object.fromEntries(keys.map((k) => [k, { [field]: value }])) });
+    for (const [k, v] of Object.entries(r.chats)) Object.assign(state.chats.get(k), v);
+    refreshInPlace(); renderArchiveStats(); toast(`${keys.length} chats updated`);
+  } catch (e) { toast(`Error: ${e.message}`); }
+}
+document.querySelectorAll("[data-bulk]").forEach((b) => b.addEventListener("click", () => bulk(b.dataset.bulk === "1")));
+
+// ---------- polling ----------
+async function loadChats() {
+  try {
+    const data = await api("/api/chats");
+    if (!state.sections.length) {
+      state.sections = data.sections;
+      for (const s of data.sections) $("section").append(el("option", { value: s.key, text: s.title }));
+      setText("manifestPath", data.manifest_path);
+    }
+    const before = new Set(state.chats.keys());
+    const next = new Map(data.chats.map((c) => [c.chat_key, c]));
+    // A poll can race with a save that is still in flight: keep the user's latest edits
+    const recentEdit = Date.now() - (state.editedAt || 0) < 2500;
+    for (const [k, c] of next) {
+      const old = state.chats.get(k);
+      if (!old) continue;
+      if (recentEdit) for (const f of [...FLAGS, "priority"]) c[f] = old[f];
+      if (old.remote && !c.remote) c.remote = old.remote;
+    }
+    state.chats = next;
+    state.canFetch = !!data.can_fetch;
+    renderFolderOptions(data.folders || []);
+    renderArchiveStats();
+    const setChanged = before.size !== next.size || [...next.keys()].some((k) => !before.has(k));
+    if (!state.order.length || setChanged) reorder(); else refreshInPlace();
+  } catch (e) { toast(`Failed to load chats: ${e.message}`); }
+}
+async function loadStatus() {
+  try { renderStatus(await api(`/api/status${state.logSince ? `?log_since=${state.logSince}` : ""}`)); }
+  catch { setText("tkPhase", "disconnected"); }
+}
+async function start() {
+  try { await api("/api/sync/start", {}); toast("Sync requested"); } catch (e) { toast(e.message); }
+}
+$("startBtn").addEventListener("click", start);
+$("sandBtn").addEventListener("click", start);
+
+route();
+loadChats(); loadStatus();
+setInterval(() => { if (!document.hidden) loadStatus(); }, 1000);
+setInterval(() => {
+  if (document.hidden) return;
+  // never refresh table data while the user is typing in it
+  if (document.activeElement?.closest?.("#rows input[type=number]")) return;
+  loadChats();
+}, 5000);
+</script>
+</body>
+</html>
