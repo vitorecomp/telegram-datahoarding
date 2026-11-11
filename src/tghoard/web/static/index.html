@@ -253,6 +253,7 @@
   /* ---------- chats table (Linear-style) ---------- */
   .tbl-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin: 4px 0 10px; }
   .tbl-head h1 { font: 600 24px var(--sans); margin: 0; letter-spacing: -.01em; }
+  #countNote { color: var(--warn); margin-right: auto; }
   .tabs { display: flex; gap: 18px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
   .tabs button { background: none; border: 0; padding: 8px 0; color: var(--muted); font-size: 13px;
                  border-bottom: 2px solid transparent; margin-bottom: -1px; }
@@ -286,7 +287,7 @@
   tr.off td:not(.ctl):not(.idx) { opacity: .45; }
   .idx { color: var(--dim); font: 11px var(--mono); text-align: right; width: 34px; }
   .num { text-align: right; font-variant-numeric: tabular-nums; } .c { text-align: center; }
-  .chat { display: flex; gap: 10px; align-items: center; min-width: 240px; max-width: 360px; }
+  .chat { display: flex; gap: 10px; align-items: center; min-width: 220px; max-width: 290px; }
   .chat > div:last-child { min-width: 0; }
   .av { width: 28px; height: 28px; border-radius: 50%; flex: none; display: grid; place-items: center; position: relative;
         color: #fff; font: 600 11px var(--sans); overflow: hidden; }
@@ -314,10 +315,44 @@
                                          border-top: 0; border-right: 0; transform: rotate(-45deg) translate(1px, -1px); }
   .dt { display: inline-flex; align-items: center; gap: 7px; justify-content: flex-end; }
   .dt .tot { color: var(--dim); } .dt.full .got { color: var(--ok); }
-  .dt .mb { width: 38px; height: 4px; background: #2e2e33; position: relative; }
+  .dt .mb { width: 30px; height: 4px; background: #2e2e33; position: relative; }
   .dt .mb i { position: absolute; inset: 0 auto 0 0; background: var(--muted); }
   .dt.full .mb i { background: var(--ok); }
   .muted { color: var(--dim); }
+  /* space still needed per category: "↓ 1.2 GB" (exact) / "↓ ~3.4 GB" (estimated) */
+  .todo { font: 10.5px var(--mono); color: var(--dim); margin-top: 3px; white-space: nowrap; }
+  .todo.on { color: var(--accent-2); }
+  .todo .over { color: var(--warn); }
+  td.todo-col.on { color: var(--accent-2); }
+  /* navbar button + modal (media over the size limit) */
+  .navbtn { font: 12px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--muted);
+            background: none; border: 1px solid transparent; padding: 6px 12px; cursor: pointer; }
+  .navbtn:hover { color: var(--text); }
+  .navbtn em { font-style: normal; color: var(--warn); margin-left: 4px; }
+  .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 40; display: grid; place-items: center; }
+  .modal-bg[hidden] { display: none; }
+  .modal { background: var(--tile); border: 1px solid var(--line-2); width: min(1100px, 94vw); max-height: 86vh;
+           display: flex; flex-direction: column; }
+  .modal header { display: flex; align-items: baseline; gap: 14px; padding: 16px 20px; border-bottom: 1px solid var(--line); }
+  .modal header h2 { margin: 0; font: 600 15px var(--sans); }
+  .modal header .x { margin-left: auto; background: none; border: 0; color: var(--muted); font-size: 20px; cursor: pointer; }
+  .modal header .x:hover { color: var(--text); }
+  .modal .sum { padding: 12px 20px; font: 12px var(--mono); color: var(--muted); border-bottom: 1px solid var(--line);
+                display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: center; }
+  .modal .sum b { color: var(--text); font-weight: 600; }
+  .modal .sum label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; margin-left: auto; }
+  .modal .reach { padding: 10px 20px; font: 11.5px var(--mono); color: var(--muted); border-bottom: 1px solid var(--line);
+                  display: flex; flex-wrap: wrap; gap: 6px 18px; }
+  .modal .reach span b { color: var(--accent-2); font-weight: 600; }
+  .modal .body { overflow: auto; }
+  .modal table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .modal th { position: sticky; top: 0; background: var(--tile-2); text-align: left; font: 10.5px var(--mono);
+              letter-spacing: .08em; text-transform: uppercase; color: var(--muted); padding: 8px 12px; }
+  .modal td { padding: 7px 12px; border-top: 1px solid var(--line); }
+  .modal td.num, .modal th.num { text-align: right; font-family: var(--mono); }
+  .modal tr.unsel td { color: var(--dim); }
+  .modal .empty { padding: 30px 20px; color: var(--muted); text-align: center; }
+  .modal .more { padding: 10px 20px; color: var(--dim); font: 11.5px var(--mono); }
   .toast { position: fixed; bottom: 18px; right: 18px; background: var(--text); color: var(--sand-ink);
            font: 12px var(--mono); padding: 9px 14px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 50; }
   .toast.show { opacity: 1; }
@@ -329,6 +364,7 @@
   <nav class="nav">
     <a href="#/dashboard" data-view="dashboard">Dashboard</a>
     <a href="#/chats" data-view="chats">Chats</a>
+    <button class="navbtn" id="bigBtn" title="Media not downloaded because it is larger than the size limit (TGHOARD_MAX_MEDIA_MB)">Too large<em id="bigCnt"></em></button>
   </nav>
   <div class="ticker">
     <div class="tk"><b>Status</b><span id="tkPhase">—</span></div>
@@ -336,6 +372,7 @@
     <div class="tk"><b>Selected chats</b><span id="tkChats">—</span></div>
     <div class="tk"><b>Archived messages</b><span id="tkMsgs">—</span></div>
     <div class="tk"><b>Archive size</b><span id="tkSize">—</span></div>
+    <div class="tk" title="Space the checked categories still need (~ = includes an estimate for history not archived yet)"><b>To download</b><span id="tkTodo">—</span></div>
     <div class="tk"><b>Speed</b><span id="tkSpeed">—</span></div>
     <div class="tk"><b>FloodWaits</b><span id="tkFloods">—</span></div>
   </div>
@@ -428,7 +465,7 @@
 
   <!-- ================= CHATS TABLE ================= -->
   <section id="view-chats" class="view" hidden>
-    <div class="tbl-head"><h1>Chats</h1><span class="hint" id="manifestPath"></span></div>
+    <div class="tbl-head"><h1>Chats</h1><span class="hint" id="countNote"></span><span class="hint" id="manifestPath"></span></div>
     <div class="tabs" id="tabs">
       <button data-filter="" class="on">All <em id="cntAll"></em></button>
       <button data-filter="on">Selected <em id="cntOn"></em></button>
@@ -464,8 +501,9 @@
           <th class="num" data-sort="videos" title="downloaded / total (sorts by total)">Videos</th>
           <th class="num" data-sort="audio" title="downloaded / total (sorts by total)">Audio</th>
           <th class="num" data-sort="files" title="downloaded / total (sorts by total)">Files</th>
-          <th class="num" data-sort="links">Links</th>
           <th class="num" data-sort="size">Size</th>
+          <th class="num" data-sort="todo" title="Space the checked categories still need: exact for archived messages, ~estimated for history not archived yet (count on Telegram × average size)">To download</th>
+          <th class="num" data-sort="links">Links</th>
           <th data-sort="period"><span class="ic">▦</span>Period</th>
           <th data-sort="joined" title="When you joined"><span class="ic">▦</span>Joined</th>
         </tr></thead>
@@ -475,6 +513,15 @@
   </section>
 </main>
 <div id="toast" class="toast"></div>
+<div class="modal-bg" id="bigModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="bigTitle">
+    <header><h2 id="bigTitle">Not downloaded: larger than the size limit</h2><span class="hint" id="bigLimit"></span>
+      <button class="x" id="bigClose" title="Close (Esc)">×</button></header>
+    <div class="sum" id="bigSum"></div>
+    <div class="reach" id="bigReach" hidden></div>
+    <div class="body" id="bigBody"></div>
+  </div>
+</div>
 
 <script>
 "use strict";
@@ -485,7 +532,9 @@ const state = {
   chats: new Map(), rows: new Map(), order: [], status: null, logSince: null, sections: [],
   folders: new Map(), inAnyFolder: new Set(), live: new Map(), canFetch: false,
   filter: "", sort: { key: "priority", dir: -1 }, speedWin: 300, view: "dashboard",
+  mediaAvg: {}, maxMedia: null, mediaPending: false,
 };
+const CATS = ["photos", "videos", "audio", "files"];
 
 // ---------- formatting / dom ----------
 const fmtNum = (n) => (n || 0).toLocaleString("en-US");
@@ -731,6 +780,9 @@ function renderArchiveStats() {
   setText("tkChats", `${fmtNum(on)} / ${fmtNum(all.length)}`);
   setText("tkMsgs", fmtCompact(all.reduce((a, c) => a + c.stats.messages, 0)));
   setText("tkSize", fmtBytes(all.reduce((a, c) => a + c.stats.total_bytes, 0)));
+  const todo = all.map((c) => selectedTodo(c));
+  const todoBytes = todo.reduce((a, t) => a + t.total, 0);
+  setText("tkTodo", state.mediaPending ? "…" : todoBytes ? (todo.some((t) => t.estimated) ? "~" : "") + fmtBytes(todoBytes) : "—");
   setText("cntAll", all.length || ""); setText("cntOn", on || ""); setText("cntOff", (all.length - on) || "");
   const top = all.filter((c) => c.stats.total_bytes > 0).sort((a, b) => b.stats.total_bytes - a.stats.total_bytes).slice(0, 7);
   const sig = top.map((c) => `${c.chat_key}:${c.stats.total_bytes}`).join(",");
@@ -786,7 +838,11 @@ function createRow(c) {
     tr._boxes[f] = cb; tr.append(el("td", { class: "c ctl" }, cb));
   }
   tr._cells = {};
-  for (const k of [...REMOTE_KEYS, "links", "size"]) { tr._cells[k] = el("td", { class: "num" }); tr.append(tr._cells[k]); }
+  for (const k of [...REMOTE_KEYS, "size", "todo", "links"]) {
+    const td = el("td", { class: k === "todo" ? "num todo-col" : "num" });
+    if (CATS.includes(k)) { td._dtBox = el("div"); td._todo = el("div", { class: "todo" }); td.append(td._dtBox, td._todo); }
+    tr._cells[k] = td; tr.append(td);
+  }
   tr._period = el("td", { class: "muted" }); tr.append(tr._period);
   tr._joined = el("td", { class: "muted" }); tr.append(tr._joined);
   return tr;
@@ -794,17 +850,63 @@ function createRow(c) {
 
 // "downloaded / total on Telegram" cell with a mini bar
 function setDT(td, got, total, extra) {
+  const counting = got === null;  // files on disk not counted yet (first load of a big archive)
   got = got || 0;
   const pct = total ? Math.min(100, Math.floor((100 * got) / total)) : 0;
-  const sig = `${got}|${total}`;
+  const sig = `${counting}|${got}|${total}`;
   if (td._sig !== sig) {
     td._sig = sig;
-    td.replaceChildren(el("span", { class: `dt${total != null && total > 0 && got >= total ? " full" : ""}` },
-      el("span", { class: "got", text: fmtCompact(got) }), el("span", { class: "tot", text: `/ ${fmtCompact(total)}` }),
-      el("span", { class: "mb" }, el("i", { style: `width:${total ? pct : 0}%` }))));
+    (td._dtBox || td).replaceChildren(el("span", { class: `dt${!counting && total != null && total > 0 && got >= total ? " full" : ""}` },
+      el("span", { class: "got", text: counting ? "…" : fmtCompact(got) }), el("span", { class: "tot", text: `/ ${fmtCompact(total)}` }),
+      el("span", { class: "mb" }, el("i", { style: `width:${total && !counting ? pct : 0}%` }))));
   }
-  td.title = total == null ? `${fmtNum(got)} downloaded · total on Telegram unknown · ${extra}`
-                           : `${fmtNum(got)} of ${fmtNum(total)} (${pct}%) · ${extra}`;
+  td.title = counting ? "counting the files on disk…"
+    : total == null ? `${fmtNum(got)} downloaded · total on Telegram unknown · ${extra}`
+                    : `${fmtNum(got)} of ${fmtNum(total)} (${pct}%) · ${extra}`;
+}
+
+// Space each category still needs (same formula as chat_stats.estimate_to_download):
+// exact for queued media of archived messages; history not archived yet (Telegram total
+// minus what the archive knows) + queued items of unknown size are estimated with the
+// chat's average size (or the archive-wide one).
+const MIN_AVG_SAMPLE = 3;
+function toDownload(c, cat) {
+  const st = c.stats, remote = c.remote || {};
+  const qn = st.queued_counts?.[cat] || 0, qb = st.queued_bytes?.[cat] || 0, qu = st.queued_unsized?.[cat] || 0;
+  const have = st.media_counts?.[cat] || 0, sized = have + qn - qu;
+  const avg = sized >= MIN_AVG_SAMPLE ? (st.media_bytes[cat] + qb) / sized : (state.mediaAvg[cat] ?? null);
+  const tot = remote[cat];
+  const unarchived = Number.isInteger(tot) ? Math.max(0, tot - have - qn) : 0;
+  const estItems = unarchived + qu;
+  const est = estItems ? (avg ? Math.round(estItems * avg) : null) : 0;
+  return { exact: qb, queued: qn, est, estItems, unarchived, avg, total: qb + (est || 0),
+           overN: st.oversized_counts?.[cat] || 0, overB: st.oversized_bytes?.[cat] || 0 };
+}
+function fmtTodo(t) {
+  if (!t.total && !t.estItems) return "";
+  if (t.est == null) return t.exact ? `${fmtBytes(t.exact)} + ?` : "?";
+  return (t.estItems ? "~" : "") + fmtBytes(t.total);
+}
+function todoTip(t, on) {
+  if (!t.total && !t.estItems) return "To download: nothing left";
+  const parts = [];
+  if (t.queued) parts.push(`${fmtBytes(t.exact)} exact (${fmtNum(t.queued)} queued)`);
+  if (t.estItems) parts.push(t.est == null ? `${fmtNum(t.estItems)} item(s) of unknown size`
+    : `~${fmtBytes(t.est)} estimated (${fmtNum(t.estItems)} not archived yet × ${fmtBytes(t.avg)} avg)`);
+  let tip = `To download: ${parts.join(" + ")}`;
+  if (t.overN) tip += `\n⚠ ${fmtNum(t.overN)} queued item(s), ${fmtBytes(t.overB)}, are over the size limit`;
+  if (!on) tip += "\n(category unchecked: needed only if you check it)";
+  return tip;
+}
+function selectedTodo(c, todos) {
+  let total = 0, estimated = false, unknown = false;
+  if (c.baixar) for (const cat of CATS) {
+    if (!c[cat]) continue;
+    const t = todos ? todos[cat] : toDownload(c, cat);
+    total += t.total; estimated ||= t.estItems > 0; unknown ||= t.est == null;
+  }
+  const text = total ? (estimated ? "~" : "") + fmtBytes(total) + (unknown ? " + ?" : "") : (unknown ? "?" : "");
+  return { total, estimated, text };
 }
 
 function updateRow(tr, c) {
@@ -815,9 +917,27 @@ function updateRow(tr, c) {
   for (const f of FLAGS) if (tr._boxes[f].checked !== !!c[f]) tr._boxes[f].checked = !!c[f];
   tr.classList.toggle("off", !c.baixar);
   setDT(tr._cells.messages, st.messages, remote.messages, st.deleted ? `${fmtNum(st.deleted)} deleted (preserved)` : "messages");
-  for (const cat of ["photos", "videos", "audio", "files"]) setDT(tr._cells[cat], st.media_counts[cat], remote[cat], fmtBytes(st.media_bytes[cat]));
+  const todos = {};
+  for (const cat of CATS) {
+    const td = tr._cells[cat], t = (todos[cat] = toDownload(c, cat)), on = !!(c.baixar && c[cat]);
+    setDT(td, state.mediaPending ? null : st.media_counts[cat], remote[cat], fmtBytes(st.media_bytes[cat]));
+    const txt = state.mediaPending ? "" : fmtTodo(t);  // estimates need the files counted
+    const sig = `${txt}|${on}|${t.overN}`;
+    if (td._todo._sig !== sig) {
+      td._todo._sig = sig;
+      td._todo.className = `todo${on ? " on" : ""}`;
+      td._todo.replaceChildren(...(txt ? [`↓ ${txt}`] : []),
+        ...(t.overN ? [" ", el("span", { class: "over", text: `⚠${fmtNum(t.overN)}`, title: "over the size limit" })] : []));
+    }
+    if (!state.mediaPending) td.title += "\n" + todoTip(t, on);
+  }
   setNodeText(tr._cells.links, fmtNum(st.links));
-  setNodeText(tr._cells.size, st.total_bytes ? fmtBytes(st.total_bytes) : "—");
+  setNodeText(tr._cells.size, state.mediaPending ? "…" : st.total_bytes ? fmtBytes(st.total_bytes) : "—");
+  const sel = selectedTodo(c, todos);
+  setNodeText(tr._cells.todo, state.mediaPending ? "…" : sel.text || "—");
+  tr._cells.todo.classList.toggle("on", !!sel.total);
+  tr._cells.todo.title = CATS.map((cat) => `${cat}${c.baixar && c[cat] ? "" : " (unchecked)"}: ${fmtTodo(todos[cat]) || "nothing"}`).join("\n")
+    + "\n\nCounts only the checked categories of a checked chat.";
   setNodeText(tr._period, st.first_month ? (st.first_month === st.last_month ? st.first_month : `${st.first_month} → ${st.last_month}`) : "—");
   setNodeText(tr._joined, st.joined_at ? new Date(st.joined_at).toLocaleDateString("en-US") : "—");
   tr._joined.title = (st.joined || []).map((j) => `${j.account || "?"}: ${new Date(j.joined_at).toLocaleString("en-US")}`
@@ -893,6 +1013,7 @@ function sortValue(c, key) {
     case "messages": case "photos": case "videos": case "audio": case "files": return c.remote?.[key] ?? null;
     case "links": return c.stats.links;
     case "size": return c.stats.total_bytes;
+    case "todo": return selectedTodo(c).total || null;
     case "period": return c.stats.last_month;
     case "joined": return c.stats.joined_at;
   }
@@ -1028,6 +1149,13 @@ async function loadChats() {
     }
     state.chats = next;
     state.canFetch = !!data.can_fetch;
+    state.mediaAvg = data.media_avg || {};
+    const wasPending = state.mediaPending;
+    state.mediaPending = !!data.media_pending;
+    setText("countNote", state.mediaPending ? "⏳ counting the files on disk — media counts and sizes appear in a moment" : "");
+    if (wasPending && !state.mediaPending) markStale();  // media counts changed under the sort
+    state.maxMedia = data.max_media_bytes ?? null;
+    renderBigBadge(data.oversized);
     renderFolderOptions(data.folders || []);
     renderArchiveStats();
     const setChanged = before.size !== next.size || [...next.keys()].some((k) => !before.has(k));
@@ -1043,6 +1171,63 @@ async function start() {
 }
 $("startBtn").addEventListener("click", start);
 $("sandBtn").addEventListener("click", start);
+
+// ---------- "Too large" modal: queued media over the size limit ----------
+function renderBigBadge(sum) {
+  const n = sum?.items || 0;
+  setText("bigCnt", n ? fmtCompact(n) : "");
+  $("bigBtn").title = state.maxMedia == null
+    ? "No size limit (TGHOARD_MAX_MEDIA_MB=0): nothing is skipped for size"
+    : `${fmtNum(n)} file(s), ${fmtBytes(sum?.bytes || 0)}, not downloaded because they exceed ${fmtBytes(state.maxMedia)}`;
+}
+const big = { all: false };
+async function openBig() {
+  $("bigModal").hidden = false;
+  $("bigBody").replaceChildren(el("div", { class: "empty", text: "Loading…" }));
+  try { renderBig(await api(`/api/oversized${big.all ? "?all=1" : ""}`)); }
+  catch (e) { $("bigBody").replaceChildren(el("div", { class: "empty", text: `Failed to load: ${e.message}` })); }
+}
+function closeBig() { $("bigModal").hidden = true; }
+function renderBig(r) {
+  const limit = r.limit_bytes;
+  setText("bigLimit", limit == null ? "no size limit" : `limit ${fmtBytes(limit)} (TGHOARD_MAX_MEDIA_MB)`);
+  const all = el("input", { type: "checkbox" });
+  all.checked = big.all;
+  all.addEventListener("change", () => { big.all = all.checked; openBig(); });
+  $("bigSum").replaceChildren(
+    limit == null
+      ? el("span", { text: "TGHOARD_MAX_MEDIA_MB=0: there is no size limit, nothing is skipped for size." })
+      : el("span", {}, el("b", { text: fmtNum(r.total_items) }), ` file(s) · `, el("b", { text: fmtBytes(r.total_bytes) }),
+          " not downloaded. Raise TGHOARD_MAX_MEDIA_MB in .env (or run sync --max-media-mb N) and they are downloaded on the next sync."),
+    el("label", {}, all, "include unchecked chats/categories"));
+  const reach = (r.thresholds || []).filter(([, n]) => n > 0);
+  $("bigReach").hidden = !reach.length;
+  $("bigReach").replaceChildren(el("span", { text: "a limit of…" }), ...reach.map(([mb, n, b]) =>
+    el("span", {}, `${mb >= 1000 ? `${mb / 1000} GB` : `${mb} MB`} → `, el("b", { text: fmtNum(n) }), ` file(s), ${fmtBytes(b)}`)));
+  if (!r.items.length) {
+    $("bigBody").replaceChildren(el("div", { class: "empty", text: limit == null ? "" : "Nothing over the limit 🎉" }));
+    return;
+  }
+  const tbody = el("tbody");
+  for (const it of r.items) {
+    tbody.append(el("tr", { class: it.selected ? "" : "unsel", title: it.selected ? "" : "chat or category unchecked in chats.md" },
+      el("td", {}, it.title, el("div", { class: "muted", text: it.chat_key })),
+      el("td", { text: it.category }),
+      el("td", { text: it.file_name || it.mime_type || "—" }),
+      el("td", { class: "num", text: it.month || "—" }),
+      el("td", { class: "num", text: `#${it.msg_id}` }),
+      el("td", { class: "num", text: fmtBytes(it.size_bytes) })));
+  }
+  const head = el("tr", {}, ...["Chat", "Category", "File", "Month", "Message", "Size"].map((h, i) =>
+    el("th", { class: i >= 3 ? "num" : "", text: h })));
+  const kids = [el("table", {}, el("thead", {}, head), tbody)];
+  if (r.total_items > r.items.length) kids.push(el("div", { class: "more", text: `… and ${fmtNum(r.total_items - r.items.length)} more (largest shown first)` }));
+  $("bigBody").replaceChildren(...kids);
+}
+$("bigBtn").addEventListener("click", openBig);
+$("bigClose").addEventListener("click", closeBig);
+$("bigModal").addEventListener("click", (e) => { if (e.target === $("bigModal")) closeBig(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("bigModal").hidden) closeBig(); });
 
 route();
 loadChats(); loadStatus();

@@ -25,6 +25,13 @@ from tghoard.migrations import (
     record_applied,
 )
 from tghoard.storage.atomic import atomic_write_text
+from tghoard.storage.chat_stats import (
+    compute_all_chat_stats,
+    estimate_to_download,
+    list_oversized_media,
+    media_size_averages,
+    open_readonly_db,
+)
 from tghoard.storage.chats_manifest import load_chats_manifest
 from tghoard.storage.checkpoint_db import AccountRecord, CheckpointDB
 from tghoard.storage.paths import iter_all_part_files, single_line
@@ -41,6 +48,7 @@ from tghoard.sync.rebuilder import (
     rebuild_checkpoint_from_plaintext,
     rebuild_markdown_from_plaintext,
 )
+from tghoard.sync.reporter import human_bytes
 from tghoard.sync.watcher import run_live_watcher
 from tghoard.telegram.accounts import AccountManager
 from tghoard.telegram.entities import classify_entity_to_chat_info
@@ -305,7 +313,8 @@ def cmd_sync(
     ] = None,
     no_browser: Annotated[
         bool,
-        typer.Option("--no-browser", help="Do not open the browser automatically."),
+        # Kept so existing scripts don't break: `sync` only prints the web UI link now
+        typer.Option("--no-browser", hidden=True, help="No-op (the browser is never opened)."),
     ] = False,
 ) -> None:
     """Sync messages, links, metadata and media according to `<data_dir>/chats.md`.
@@ -354,14 +363,14 @@ def cmd_sync(
             live=live,
             bridge=bridge,
             port=web_port if web_port is not None else cfg.web_port,
+            max_media_bytes=cfg.max_media_bytes,
         )
         url = ui.start()
+        # Just the link (no browser tab is opened): click it or paste it in the browser
         console.print(
             f"🌐 Web UI: [bold][link={url}]{url}[/link][/bold] "
             "[dim](manages chats.md; use --no-web to disable)[/dim]"
         )
-        if interactive and not no_browser:
-            threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
         return ui
 
     async def _register_entities(connected: list[tuple[AccountRecord, Any]]) -> None:
@@ -680,10 +689,35 @@ def cmd_search(
 
 
 @app.command("stats")
-def cmd_stats(data_dir: DataDirOption = None) -> None:
+def cmd_stats(
+    data_dir: DataDirOption = None,
+    to_download: Annotated[
+        bool,
+        typer.Option(
+            "--to-download",
+            help="Space each chat still needs per media category (exact for archived "
+            "messages, ~estimated for history not archived yet).",
+        ),
+    ] = False,
+    too_large: Annotated[
+        bool,
+        typer.Option(
+            "--too-large",
+            help="List queued media not downloaded because it exceeds TGHOARD_MAX_MEDIA_MB.",
+        ),
+    ] = False,
+    include_all: Annotated[
+        bool,
+        typer.Option("--all", help="With --too-large/--to-download: include unchecked chats."),
+    ] = False,
+    show: Annotated[int, typer.Option("--show", help="How many rows to list.")] = 30,
+) -> None:
     """Show full statistics of the plain-text archive and the checkpoint database."""
     cfg = _resolve_runtime_config(data_dir=data_dir)
     _require_current_layout(cfg)
+    if to_download or too_large:
+        _print_media_reports(cfg, to_download, too_large, include_all, show)
+        return
     with CheckpointDB(cfg.checkpoint_db_path) as db:
         db_counts = db.summary_counts()
 
@@ -715,6 +749,104 @@ def cmd_stats(data_dir: DataDirOption = None) -> None:
     table.add_row("Unique media in the global index", str(db_counts["unique_media_files"]))
     table.add_row("Pending media (checkbox unchecked)", str(db_counts["pending_media"]))
     console.print(table)
+    console.print(
+        "[dim]More: `stats --to-download` (space still needed per chat) and "
+        "`stats --too-large` (media skipped by the size limit).[/dim]"
+    )
+
+
+def _print_media_reports(
+    cfg: AppConfig, to_download: bool, too_large: bool, include_all: bool, show: int
+) -> None:
+    """`stats --to-download` / `stats --too-large` (offline: checkpoint.db + cached totals)."""
+    entries = load_chats_manifest(cfg.chats_manifest_path)
+    conn = open_readonly_db(cfg.checkpoint_db_path)
+    try:
+        if to_download:
+            stats = compute_all_chat_stats(cfg.data_dir, conn, max_media_bytes=cfg.max_media_bytes)
+            remote = TelegramBridge(cfg.internal_dir).all_cached_counts()
+            averages = media_size_averages(stats.values())
+            rows: list[tuple[int, list[str]]] = []
+            for key, e in entries.items():
+                if not (e.baixar or include_all):
+                    continue
+                st = stats.get(key)
+                if st is None:
+                    continue
+                todo = estimate_to_download(st, remote.get(key), averages)
+                cells, selected, estimated = [], 0, False
+                for cat in ALL_MEDIA_CATEGORIES:
+                    t = todo[cat]
+                    on = e.baixar and getattr(e, cat)
+                    if on:
+                        selected += t.total_bytes
+                        estimated = estimated or t.is_estimate
+                    text = _fmt_todo(t)
+                    cells.append(text if on or not text else f"[dim]{text}[/dim]")
+                if selected or include_all:
+                    total = ("~" if estimated else "") + human_bytes(selected)
+                    rows.append((selected, [escape(single_line(e.title)), *cells, total]))
+            table = Table(title="Space still needed (checked categories; dim = unchecked)")
+            table.add_column("Chat", overflow="fold")
+            for cat in ALL_MEDIA_CATEGORIES:
+                table.add_column(cat.capitalize(), justify="right")
+            table.add_column("Checked total", justify="right", style="bold")
+            for _, cells in sorted(rows, key=lambda r: -r[0])[:show]:
+                table.add_row(*cells)
+            console.print(table)
+            console.print(
+                "[dim]Exact for media of archived messages; ~ = estimate for history not archived "
+                "yet (total on Telegram × average size). Telegram totals come from the web UI's "
+                "cache (.tghoard/remote_counts.json) — chats never opened in the web UI during "
+                "a sync count only what is archived.[/dim]"
+            )
+        if too_large:
+            rep = list_oversized_media(
+                conn, entries, cfg.max_media_bytes, include_unselected=include_all, max_items=show
+            )
+            if rep.limit_bytes is None:
+                console.print("TGHOARD_MAX_MEDIA_MB=0: no size limit, nothing is skipped for size.")
+                return
+            table = Table(title=f"Not downloaded: larger than {human_bytes(rep.limit_bytes)}")
+            for col, just in (
+                ("Chat", "left"),
+                ("Category", "left"),
+                ("File", "left"),
+                ("Month", "right"),
+                ("Message", "right"),
+                ("Size", "right"),
+            ):
+                table.add_column(col, justify=just, overflow="fold")  # type: ignore[arg-type]
+            for it in rep.items:
+                style = None if it.selected else "dim"
+                table.add_row(
+                    escape(single_line(it.title)),
+                    it.category,
+                    escape(single_line(it.file_name or it.mime_type or "—")),
+                    it.month or "—",
+                    f"#{it.msg_id}",
+                    human_bytes(it.size_bytes),
+                    style=style,
+                )
+            console.print(table)
+            console.print(
+                f"{rep.total_items} file(s), {human_bytes(rep.total_bytes)} in total. Raise "
+                "TGHOARD_MAX_MEDIA_MB (or run `sync --max-media-mb N`) to download them."
+            )
+            for mb, n, b in rep.thresholds:
+                if n:
+                    console.print(f"  a limit of {mb} MB → {n} file(s), {human_bytes(b)}")
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _fmt_todo(t: Any) -> str:
+    if not t.total_bytes and not t.estimated_items:
+        return ""
+    if t.estimated_bytes is None:
+        return f"{human_bytes(t.exact_bytes)} + ?" if t.exact_bytes else "?"
+    return ("~" if t.is_estimate else "") + human_bytes(t.total_bytes)
 
 
 # ----------------------------------------------------------------------
@@ -779,6 +911,7 @@ def cmd_web(
         db_path=cfg.checkpoint_db_path,
         bridge=TelegramBridge(cfg.internal_dir),  # cache only (not connected)
         port=port if port is not None else cfg.web_port,
+        max_media_bytes=cfg.max_media_bytes,
     )
     url = web.start()
     console.print(f"🌐 Web UI: [bold][link={url}]{url}[/link][/bold] — Ctrl+C to quit")

@@ -50,9 +50,9 @@ tghoard start --data-dir /mnt/nas/telegram-backup
 ### 2. `tghoard sync`
 Reads `<data_dir>/chats.md` and syncs every chat checked with `[x] baixar`, in order of `prioridade` (highest first), downloading media according to the `[x] photos`, `[x] videos`, `[x] audio` and `[x] files` checkboxes.
 
-**Interactive mode (terminal)**: also opens the local web UI (`http://127.0.0.1:8765/`) and the browser. From the web UI you can check/uncheck chats, change priorities (even during the sync: they apply to the chats that have not started yet), view per-chat statistics and follow progress bars. When there is nothing to do — no chat selected, or the queue is finished — the sync **waits for you to press Enter** (or click *Start sync* in the web UI) to run again; `q` + Enter, Ctrl+D or Ctrl+C exit.
+**Interactive mode (terminal)**: also starts the local web UI and prints its link (`http://127.0.0.1:8765/`) — no browser tab is opened; click the link or paste it in your browser. From the web UI you can check/uncheck chats, change priorities (even during the sync: they apply to the chats that have not started yet), view per-chat statistics and follow progress bars. When there is nothing to do — no chat selected, or the queue is finished — the sync **waits for you to press Enter** (or click *Start sync* in the web UI) to run again; `q` + Enter, Ctrl+D or Ctrl+C exit.
 
-**Non-interactive mode (cron, pipe, redirection)**: runs once and exits, without waiting for Enter; the web UI is started unless `--no-web` is passed (and the browser is not opened).
+**Non-interactive mode (cron, pipe, redirection)**: runs once and exits, without waiting for Enter; the web UI is started (and its link printed) unless `--no-web` is passed.
 
 **Exit codes**: `0` everything synced · `1` some chats failed (listed in the summary; they resume on the next sync) · `2` invalid option (e.g. a malformed `--since`) or a pending required migration · `3` another tghoard process is writing to the archive · `130` interrupted with Ctrl+C (progress already checkpointed is kept).
 
@@ -73,7 +73,6 @@ Reads `<data_dir>/chats.md` and syncs every chat checked with `[x] baixar`, in o
 | `--chats-file PATH` | Use another `chats.md` |
 | `--no-web` | Do not start the web UI (pure CLI) |
 | `--web-port N` | Web UI port (default `TGHOARD_WEB_PORT` / `8765`) |
-| `--no-browser` | Do not open the browser automatically |
 | `-v` / `--verbose` | Detailed log in the terminal |
 
 **`--since`.** Messages older than the date are not fetched, and the skipped history is **not** marked as synced: a later `tghoard sync` without `--since` goes back and fetches it. New messages are always fetched.
@@ -121,6 +120,10 @@ Each adjustment shows up in the log (`🐢 FloodWait of 12s on GetFileRequest �
 
 **Statistics in the web UI.** For each chat: the chat photo (downloaded on demand, cached in `.tghoard/avatars/`) and **downloaded / total on Telegram** for messages, photos, videos, audio and files. The totals come from `messages.getHistory` (count) and `messages.getSearchCounters`, are requested only for the visible rows and are cached for 6 h in `.tghoard/remote_counts.json` (`tghoard web` without a connection shows the last known value). Media folders only exist once something has been downloaded into them.
 
+**Space still needed (web UI and `stats --to-download`).** Under each media count, `↓ size` is what downloading the rest of that category would take (blue when the category is checked, dim when it isn't): **exact** for media of messages already archived — their size is in the download queue — plus a **`~` estimate** for history not archived yet (total on Telegram − what the archive knows) × the chat's average size for that category (or the archive-wide average). `⚠N` counts queued files over the size limit. The *To download* column (and the navbar ticker) adds up the checked categories. Media of history not archived yet has no known size on Telegram's side, hence the estimate; it becomes exact as the history is synced.
+
+**Too large (navbar button, `stats --too-large`).** Lists the queued files larger than `TGHOARD_MAX_MEDIA_MB` (largest first; by default only chats and categories you checked) and how many files a higher limit would download. They are never lost: raise the limit (`.env` or `sync --max-media-mb N`) and the next sync downloads them.
+
 **Progress output.** Each line has a timestamp and the originating chat (`HH:MM:SS <chat> · ...`), since several chats run in parallel:
 
 - Default: account steps (dialogs, PTS diff, Takeout/Standard session), start/end of each chat with a `[N/total]` counter and duration, the plan of missing ranges, a `💾 batch saved` every 100 messages (ids, days and running totals), each downloaded media item (`⬇ <path> (<size>) — msg #<id>`), media skipped because of the size limit, and retry/FloodWait warnings.
@@ -147,6 +150,9 @@ Quick inspection of the plain-text archive straight from the terminal:
 
 ```bash
 tghoard stats
+tghoard stats --to-download          # space each chat still needs, per media category
+tghoard stats --too-large            # files skipped because they exceed TGHOARD_MAX_MEDIA_MB
+tghoard stats --too-large --all --show 100   # also unchecked chats/categories
 tghoard search "benchmark"
 tghoard search "confidencial" --deleted
 tghoard search "https://" --links

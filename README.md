@@ -21,9 +21,13 @@ Opened by `tghoard sync` (or on its own with `tghoard web`). It's optional: ever
 
 ![Dashboard: live sync progress, download speed chart, download pool, throttle, queue and log](documentation/images/web-dashboard.png)
 
-**Chats** — the `chats.md` editor: check what to download per chat, set priorities, filter by section or Telegram folder, and compare what's archived with the totals on Telegram.
+**Chats** — the `chats.md` editor: check what to download per chat, set priorities, filter by section or Telegram folder, and compare what's archived with the totals on Telegram. Under each media count, **↓ the space still needed** to download that category (exact for archived messages, `~` estimated for history not archived yet), with the total of the checked categories in the *To download* column.
 
 ![Chats table: per-chat checkboxes, priority, status and downloaded/total counts for messages, photos, videos, audio and files](documentation/images/web-chats.png)
+
+<!-- **Too large** (navbar) — the files not downloaded because they exceed `TGHOARD_MAX_MEDIA_MB`, largest first, and how many a higher limit would get.
+
+![Too large: queued files over the size limit, with what a higher limit would download](documentation/images/web-too-large.png) -->
 
 ## Quick start
 
@@ -38,7 +42,7 @@ Opened by `tghoard sync` (or on its own with `tghoard web`). It's optional: ever
 # 3. Log in to Telegram (phone, code and 2FA password) and generate chats.md
 ./tghoard.sh start
 
-# 4. Sync — the web UI opens in the browser so you can pick the chats
+# 4. Sync — it prints the web UI link (http://127.0.0.1:8765/) to pick the chats
 ./tghoard.sh sync
 ```
 
@@ -80,7 +84,7 @@ Each chat has a `<kebab-case-title>-<id>` folder; renaming the chat on Telegram 
 | `web` | Web UI only (edit `chats.md`, view statistics), without connecting to Telegram |
 | `watch [-a account]` | Real-time listener (edits, deletions, presence) |
 | `search TEXT [-c chat] [--deleted] [--edited] [--links]` | Search the archive's JSON files |
-| `stats` | Archive statistics |
+| `stats [--to-download] [--too-large]` | Archive statistics; space each chat still needs per media type; files skipped by the size limit |
 | `folder-links [-f md\|txt\|csv] [--only-public] [--only-channels]` | Links of the chats in each Telegram folder |
 | `verify-media [--hash] [--fix]` | Check that every media item in the JSON files is on disk (size/SHA-256) or queued; `--fix` re-queues what is missing |
 | `account list \| add \| remove` | Manage accounts |

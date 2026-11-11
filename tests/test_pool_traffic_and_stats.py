@@ -98,24 +98,26 @@ def test_web_stats_never_block_after_first_load(tmp_path: Path, monkeypatch) -> 
         db_path=cfg.checkpoint_db_path,
         port=0,
     )
-    calls = {"n": 0}
+    calls: list[bool] = []
     real = ui._compute_stats
 
-    def slow_compute() -> Any:
-        calls["n"] += 1
-        if calls["n"] > 1:
-            time.sleep(1.0)  # a big archive taking a while
-        return real()
+    def slow_compute(*, scan_folders: bool = True) -> Any:
+        calls.append(scan_folders)
+        if scan_folders:
+            time.sleep(1.0)  # counting files on a big archive on a slow disk
+        return real(scan_folders=scan_folders)
 
     monkeypatch.setattr(ui, "_compute_stats", slow_compute)
     monkeypatch.setattr(web_server, "STATS_TTL_SECS", 0.0)
-    ui.chats_payload()  # first load computes synchronously
     t0 = time.perf_counter()
+    first = ui.chats_payload()  # database-only stats, never waits for the file count
+    assert first["media_pending"] is True
     for _ in range(3):
-        ui.chats_payload()  # stale result returned while one background refresh runs
-    assert time.perf_counter() - t0 < 0.3
-    time.sleep(1.2)
-    assert calls["n"] == 2  # exactly one background refresh, not one per request
+        ui.chats_payload()  # cached result returned while one background count runs
+    assert time.perf_counter() - t0 < 0.5
+    time.sleep(1.3)
+    assert calls == [False, True]  # one quick load + exactly one background count
+    assert ui.chats_payload()["media_pending"] is False
 
 
 def test_broken_pipe_is_silent_but_real_errors_are_reported(monkeypatch) -> None:

@@ -53,7 +53,7 @@ This document defines the architecture, mandatory invariants and workflows for A
   - `atomic.py`: Atomic plain-text writes and range helpers.
   - `paths.py`: Canonical identity (`chat_key`), `ChatPaths` (per-category layout), `kebab-title-<id>` folders and `YYYY-MM-ptNNN.json` paths.
   - `chats_manifest.py`: Tolerant parser, generator/merger of `<data_dir>/chats.md`, `update_chat_selections` (web UI edits) and `ManifestSource` (re-reading during the sync).
-  - `chat_stats.py`: Per-chat statistics (messages, media per category, links, sizes) for the web UI.
+  - `chat_stats.py`: Per-chat statistics (messages, media per category, links, sizes), space still needed per category (`estimate_to_download`) and media over the size limit (`list_oversized_media`) — used by the web UI and `tghoard stats`.
   - `checkpoint_db.py`: SQLite WAL (`checkpoint.db`), cursors, ranges, `message_locator`, `pending_media` and `media_index`.
   - `chat_writer.py`: Partitioned reading/writing of `messages/<folder>/YYYY-MM-ptNNN.json`, revisions and soft-delete.
   - `markdown_writer.py`: Generation of `links/<folder>.md` and `metadata/<folder>/*.md`.

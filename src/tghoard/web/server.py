@@ -28,7 +28,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from tghoard.storage.chat_stats import ChatStats, compute_all_chat_stats, open_readonly_db
+from tghoard.storage.chat_stats import (
+    ChatStats,
+    FolderScanCache,
+    compute_all_chat_stats,
+    list_oversized_media,
+    media_size_averages,
+    open_readonly_db,
+)
 from tghoard.storage.chats_manifest import (
     SECTION_HEADERS,
     load_chats_manifest,
@@ -78,8 +85,11 @@ class WebUI:
         bridge: TelegramBridge | None = None,
         host: str = "127.0.0.1",
         port: int = 8765,
+        max_media_bytes: int | None = None,
     ) -> None:
         self.data_dir = data_dir
+        # The sync's size limit (TGHOARD_MAX_MEDIA_MB / --max-media-mb); None = unlimited
+        self.max_media_bytes = max_media_bytes
         self.manifest_path = manifest_path
         self.db_path = db_path
         self.live = live
@@ -91,6 +101,11 @@ class WebUI:
         self._stats_lock = threading.Lock()
         self._stats_cache: tuple[float, dict[str, ChatStats]] | None = None
         self._stats_refreshing = False
+        # Files on disk are counted in the background (minutes on a big archive on a USB
+        # disk); until the first count finishes, the table shows the database-only stats.
+        self._folder_cache = FolderScanCache()
+        self._media_ready = False
+        self._last_scan_secs = 0.0
         # None = read static/index.html from disk on every page load, so UI updates show up
         # with a simple reload (no need to restart a running `sync`). Tests may set bytes.
         self._index_html: bytes | None = None
@@ -132,42 +147,65 @@ class WebUI:
         return resources.files("tghoard.web").joinpath("static/index.html").read_bytes()
 
     # -- data -----------------------------------------------------------------
-    def _compute_stats(self) -> dict[str, ChatStats]:
+    def _compute_stats(self, *, scan_folders: bool = True) -> dict[str, ChatStats]:
         conn = open_readonly_db(self.db_path)
         try:
-            return compute_all_chat_stats(self.data_dir, conn)
+            return compute_all_chat_stats(
+                self.data_dir,
+                conn,
+                max_media_bytes=self.max_media_bytes,
+                scan_folders=scan_folders,
+                folder_cache=self._folder_cache,
+            )
         finally:
             if conn is not None:
                 conn.close()
 
     def _refresh_stats_in_background(self) -> None:
+        started = time.monotonic()
         try:
             fresh = self._compute_stats()
             with self._stats_lock:
                 self._stats_cache = (time.monotonic(), fresh)
+                self._media_ready = True
         finally:
             with self._stats_lock:
                 self._stats_refreshing = False
+                self._last_scan_secs = time.monotonic() - started
+
+    def _start_refresh_locked(self) -> None:
+        if not self._stats_refreshing:
+            self._stats_refreshing = True
+            threading.Thread(
+                target=self._refresh_stats_in_background, name="tghoard-stats", daemon=True
+            ).start()
 
     def _stats(self) -> dict[str, ChatStats]:
-        """Stale-while-revalidate: big archives take seconds to scan, so requests get the
-        last result immediately and a single background thread refreshes it (computed
-        synchronously only for the very first request)."""
+        """Stale-while-revalidate: requests never wait for the files on disk to be counted.
+
+        The very first request gets database-only stats (about a second even with millions
+        of queued media); a single background thread counts the files (re-scanning only the
+        directories that changed) and refreshes the cache — at most every STATS_TTL_SECS, and
+        no more often than 3x the last scan took, so a slow disk isn't kept busy scanning.
+        """
         with self._stats_lock:
             cached = self._stats_cache
             if cached is not None:
-                if time.monotonic() - cached[0] >= STATS_TTL_SECS and not self._stats_refreshing:
-                    self._stats_refreshing = True
-                    threading.Thread(
-                        target=self._refresh_stats_in_background,
-                        name="tghoard-stats",
-                        daemon=True,
-                    ).start()
+                interval = max(STATS_TTL_SECS, 3 * self._last_scan_secs)
+                if not self._media_ready or time.monotonic() - cached[0] >= interval:
+                    self._start_refresh_locked()
                 return cached[1]
-        fresh = self._compute_stats()
+        quick = self._compute_stats(scan_folders=False)
         with self._stats_lock:
-            self._stats_cache = (time.monotonic(), fresh)
-        return fresh
+            if self._stats_cache is None:
+                self._stats_cache = (time.monotonic(), quick)
+            self._start_refresh_locked()
+            return self._stats_cache[1]
+
+    @property
+    def media_pending(self) -> bool:
+        with self._stats_lock:
+            return not self._media_ready
 
     def invalidate_stats(self) -> None:
         with self._stats_lock:
@@ -208,7 +246,42 @@ class WebUI:
             "live": self.live is not None,
             "can_fetch": self.bridge is not None and self.bridge.can_fetch,
             "folders": self._folders(),
+            # Archive-wide average media size per category: estimates the space needed by
+            # history not archived yet (see chat_stats.estimate_to_download)
+            "media_avg": media_size_averages(stats.values()),
+            "max_media_bytes": self.max_media_bytes,
+            # True until the files on disk have been counted once (media columns are 0 until
+            # then): the page shows a notice and refreshes
+            "media_pending": self.media_pending,
+            "oversized": self._oversized_summary(entries, stats),
         }
+
+    @staticmethod
+    def _oversized_summary(entries: dict[str, Any], stats: dict[str, ChatStats]) -> dict[str, int]:
+        """Queued media skipped for size in checked chats/categories (navbar badge)."""
+        items = size = 0
+        for key, e in entries.items():
+            st = stats.get(key)
+            if st is None or not e.baixar:
+                continue
+            for cat in e.enabled_categories():
+                items += st.oversized_counts.get(cat, 0)
+                size += st.oversized_bytes.get(cat, 0)
+        return {"items": items, "bytes": size}
+
+    def oversized_payload(self, *, include_unselected: bool) -> dict[str, Any]:
+        conn = open_readonly_db(self.db_path)
+        try:
+            report = list_oversized_media(
+                conn,
+                load_chats_manifest(self.manifest_path),
+                self.max_media_bytes,
+                include_unselected=include_unselected,
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+        return report.to_dict()
 
     def _folders(self) -> list[dict[str, Any]]:
         """Telegram chat folders of every account (from `.tghoard/folders.json`)."""
@@ -307,6 +380,11 @@ class WebUI:
                         path.read_bytes(),
                         "image/jpeg",
                         {"Cache-Control": "max-age=86400"},
+                    )
+                if url.path == "/api/oversized":
+                    include = parse_qs(url.query).get("all", ["0"])[0] == "1"
+                    return self._json(
+                        HTTPStatus.OK, app.oversized_payload(include_unselected=include)
                     )
                 if url.path.startswith("/api/counts/"):
                     chat_key = url.path.removeprefix("/api/counts/")
