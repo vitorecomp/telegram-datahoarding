@@ -291,7 +291,7 @@ async def test_drain_streams_the_queue_in_pages(tmp_path: Path, monkeypatch) -> 
     env.db.close()
 
 
-def test_pending_pages_are_keyset_ordered_and_skip_backoff(tmp_path: Path) -> None:
+def test_pending_pages_are_fifo_and_skip_backoff(tmp_path: Path) -> None:
     db = CheckpointDB(tmp_path / "c.db")
     rows = []
     for i in range(2500):
@@ -315,8 +315,8 @@ def test_pending_pages_are_keyset_ordered_and_skip_backoff(tmp_path: Path) -> No
     pages = list(db.iter_pending_media_pages(CHAT, ["photos"]))
     assert [len(p) for p in pages] == [1000, 1000, 500]
     flat = [r for p in pages for r in p]
-    keys = [(r.day_str, r.msg_id, r.canonical_key) for r in flat]
-    assert keys == sorted(keys) and len(set(keys)) == 2500
+    # first in, first out: exactly the order they were queued
+    assert [r.canonical_key for r in flat] == [r.canonical_key for r in rows]
 
     now = time.time()
     db.record_media_failure(rows[1], "gone", permanent=True, now=now)  # free attempt
@@ -330,7 +330,13 @@ def test_pending_pages_are_keyset_ordered_and_skip_backoff(tmp_path: Path) -> No
     assert rows[1].canonical_key in due and rows[2].canonical_key not in due
     assert len(db.list_pending_media(CHAT, ["photos"])) == 2500  # still visible
     summary = db.pending_media_summary(CHAT, ["photos"], max_bytes=10**6, due_at=now)
-    assert summary == {"due": 2449, "oversized": 50, "retrying": 1, "backed_off": 1}
+    assert summary == {
+        "due": 2449,
+        "oversized": 50,
+        "retrying": 1,
+        "backed_off": 1,
+        "expired": 0,
+    }
     db.close()
 
 
@@ -368,7 +374,7 @@ async def test_media_gone_from_the_server_is_retried_with_backoff(tmp_path: Path
     env.db.close()
 
 
-def test_old_pending_table_gets_retry_after_and_order_index(tmp_path: Path) -> None:
+def test_old_pending_table_gets_retry_after_and_fifo_index(tmp_path: Path) -> None:
     import sqlite3
 
     db_path = tmp_path / "old.db"
@@ -387,12 +393,13 @@ def test_old_pending_table_gets_retry_after_and_order_index(tmp_path: Path) -> N
     cols = {r["name"] for r in db._conn.execute("PRAGMA table_info(pending_media)")}
     assert "retry_after" in cols
     plan = db._conn.execute(
-        "EXPLAIN QUERY PLAN SELECT * FROM pending_media WHERE chat_key = ? AND downloaded = 0 "
-        "AND (day_str, msg_id, canonical_key) > (?, ?, ?) "
-        "ORDER BY day_str, msg_id, canonical_key LIMIT 10",
-        (CHAT, "2026-01", 1, "x"),
+        "EXPLAIN QUERY PLAN SELECT rowid, * FROM pending_media "
+        "INDEXED BY idx_pending_media_fifo WHERE chat_key = ? AND downloaded = 0 "
+        "AND rowid > ? ORDER BY rowid LIMIT 10",
+        (CHAT, 5),
     ).fetchall()
-    assert "idx_pending_media_order" in str([tuple(r) for r in plan])
+    text = str([tuple(r) for r in plan])
+    assert "idx_pending_media_fifo" in text and "TEMP B-TREE" not in text  # no sort per page
     db.close()
 
 

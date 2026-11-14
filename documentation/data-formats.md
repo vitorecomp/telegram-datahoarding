@@ -182,6 +182,7 @@ The entry keeps the metadata (`category`, `tg_type`, `tg_id`, `size_bytes`, …)
 |---|---|---|
 | *(absent)* | Category not selected for this chat (`[ ] photos` …) | when you check it |
 | `download_failed` | The download raised an error, the connection kept dropping, or the file arrived with a size different from the one Telegram declared (incomplete) — `pending_media.last_error` has the detail | every `sync` |
+| `download_failed` with `last_error` `FileReferenceExpiredError: …` | The message's file reference expired before the download (it is refreshed and retried once automatically) | only with `sync --retry-expired` |
 | `empty_download` | Telegram returned an empty file | every `sync` |
 | `exceeds_max_media_mb` | Larger than `TGHOARD_MAX_MEDIA_MB` (no request is spent on it) | when the limit is raised |
 | `missing_on_disk` / `corrupt_on_disk` | Set by `verify-media --fix`: the file was gone / had the wrong size or hash | next `sync` |

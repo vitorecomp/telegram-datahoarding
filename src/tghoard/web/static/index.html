@@ -1091,9 +1091,18 @@ function renderFolderOptions(folders) {
   const sig = JSON.stringify([folders.map((f) => [f.key, f.label, f.members.length]), noFolder]);
   if (sel._sig === sig) return;
   sel._sig = sig;
+  // grouped by the account (user) each folder belongs to
+  const byAccount = new Map();
+  for (const f of folders) {
+    const acc = f.account || f.key.split(":")[0];
+    if (!byAccount.has(acc)) byAccount.set(acc, []);
+    byAccount.get(acc).push(f);
+  }
   sel.replaceChildren(el("option", { value: "", text: "All folders" }),
     el("option", { value: NO_FOLDER, text: `📭 No folder · ${noFolder}` }),
-    ...folders.map((f) => el("option", { value: f.key, text: `${f.label} · ${f.members.length}` })));
+    ...[...byAccount].map(([acc, list]) => el("optgroup", { label: `👤 ${acc}` },
+      // the account also in the text: a closed <select> shows only the chosen option
+      ...list.map((f) => el("option", { value: f.key, text: `${f.label} (${acc}) · ${f.members.length}`, title: `folder of ${acc}` })))));
   sel.value = current === NO_FOLDER || state.folders.has(current) ? current : "";
   sel.hidden = folders.length === 0;
 }

@@ -205,3 +205,24 @@ def test_only_file_requests_cut_downloads_and_bursts_count_once() -> None:
         c.record(5, "GetFileRequest")
     assert c.concurrency == 8  # one cut, not 16 -> 1
     assert FloodController(max_concurrency=16).describe().startswith("pause 0.00s/page")
+
+
+def test_routine_reconnect_warnings_are_not_printed() -> None:
+    flood_control.install_log_hook()
+    logger = logging.getLogger(flood_control.client_logger_name(42))
+    printed = [
+        h
+        for h in logging.getLogger(flood_control.LOGGER_PREFIX).handlers
+        if type(h) is logging.StreamHandler
+    ]
+    assert printed
+
+    def shown(msg: str, *args: Any) -> bool:
+        rec = logger.makeRecord(logger.name, logging.WARNING, __file__, 1, msg, args, None)
+        return all(h.filter(rec) for h in printed)
+
+    # Telegram closing an idle connection (Telethon reconnects by itself): hidden
+    assert not shown("Server closed the connection: %s", "0 bytes read on a total of 8")
+    # anything else Telethon warns about is still printed
+    assert shown("Server response had invalid checksum: %s", "x")
+    assert shown("Attempt %d at connecting failed: %s: %s", 3, "OSError", "boom")

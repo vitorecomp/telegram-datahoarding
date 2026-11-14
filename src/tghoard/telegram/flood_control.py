@@ -266,6 +266,17 @@ class _TelethonFloodHandler(logging.Handler):
             pass  # never let throttling break Telethon
 
 
+# Routine connection churn Telethon logs as warnings and recovers from by itself: Telegram
+# closes idle connections (e.g. the extra file-DC connections while `sync` waits for Enter)
+# and the client reconnects on the next request. Real failures still surface as errors.
+_ROUTINE_WARNINGS = ("Server closed the connection",)
+
+
+class _HideRoutineWarnings(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not str(record.msg).startswith(_ROUTINE_WARNINGS)
+
+
 _hook_installed = False
 
 
@@ -280,5 +291,6 @@ def install_log_hook() -> None:
     warnings = logging.StreamHandler()  # ...but still show its warnings/errors, as before
     warnings.setLevel(logging.WARNING)
     warnings.setFormatter(logging.Formatter("[telethon] %(levelname)s: %(message)s"))
+    warnings.addFilter(_HideRoutineWarnings())
     logger.addHandler(warnings)
     _hook_installed = True

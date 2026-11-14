@@ -143,11 +143,19 @@ CREATE TABLE IF NOT EXISTS chat_profile_state (
 );
 """
 
-# Indexes on columns added by `_migrate` (created after the columns exist).
+# Indexes created after `_migrate` added any missing columns.
+# The download queue is first-in, first-out: rows are drained by rowid (insertion order),
+# and a failed item is re-inserted at the back (see `record_media_failure`). An index on
+# (chat_key, downloaded) keeps its entries in rowid order within each chat.
 POST_MIGRATION_SQL = """
-CREATE INDEX IF NOT EXISTS idx_pending_media_order
-    ON pending_media (chat_key, downloaded, day_str, msg_id, canonical_key);
+DROP INDEX IF EXISTS idx_pending_media_order;
+CREATE INDEX IF NOT EXISTS idx_pending_media_fifo ON pending_media (chat_key, downloaded);
 """
+
+# Downloads that failed because the message's file reference had expired (the reference was
+# fetched too long before the download). Not retried by default: `sync --retry-expired`.
+EXPIRED_REFERENCE_ERROR = "FileReferenceExpired"
+_EXPIRED_SQL = f"(last_error IS NOT NULL AND last_error LIKE '{EXPIRED_REFERENCE_ERROR}%')"
 
 PENDING_PAGE_SIZE = 1000
 
@@ -213,6 +221,7 @@ class PendingMediaRow:
     size_bytes: int | None
     attempts: int = 0
     last_error: str | None = None
+    seq: int = 0  # position in the queue (rowid: first in, first out)
 
 
 @dataclass
@@ -832,6 +841,7 @@ class CheckpointDB:
             size_bytes=int(r["size_bytes"]) if r["size_bytes"] is not None else None,
             attempts=int(r["attempts"] or 0),
             last_error=r["last_error"],
+            seq=int(r["seq"]) if "seq" in r.keys() else 0,
         )
 
     def list_pending_media_page(
@@ -839,32 +849,36 @@ class CheckpointDB:
         chat_key: str,
         categories: Iterable[MediaCategory],
         *,
-        after: tuple[str, int, str] | None = None,
+        after: int | None = None,
         limit: int = PENDING_PAGE_SIZE,
         due_at: float | None = None,
+        skip_expired: bool = False,
     ) -> list[PendingMediaRow]:
-        """One page of a chat's pending media, ordered by `(day_str, msg_id, canonical_key)`.
+        """One page of a chat's pending media in queue order (first in, first out).
 
-        Keyset pagination: pass the last row's `(day_str, msg_id, canonical_key)` as
-        `after` to get the next page. With `due_at` (unix time), rows still in a
-        permanent-failure backoff (`retry_after > due_at`) are left out.
+        Keyset pagination on the queue position: pass the last row's `seq` as `after` to get
+        the next page. With `due_at` (unix time), rows still in a permanent-failure backoff
+        (`retry_after > due_at`) are left out; `skip_expired` leaves out downloads that
+        failed with an expired file reference.
         """
         cats = list(categories)
         if not cats:
             return []
         placeholders = ",".join("?" for _ in cats)
         sql = (
-            "SELECT * FROM pending_media "
+            "SELECT rowid AS seq, * FROM pending_media INDEXED BY idx_pending_media_fifo "
             f"WHERE chat_key = ? AND downloaded = 0 AND category IN ({placeholders})"
         )
         params: list[Any] = [chat_key, *cats]
         if due_at is not None:
             sql += " AND (retry_after IS NULL OR retry_after <= ?)"
             params.append(due_at)
+        if skip_expired:
+            sql += f" AND NOT {_EXPIRED_SQL}"
         if after is not None:
-            sql += " AND (day_str, msg_id, canonical_key) > (?, ?, ?)"
-            params.extend(after)
-        sql += " ORDER BY day_str ASC, msg_id ASC, canonical_key ASC LIMIT ?"
+            sql += " AND rowid > ?"
+            params.append(int(after))
+        sql += " ORDER BY rowid ASC LIMIT ?"
         params.append(int(limit))
         return [self._row_to_pending(r) for r in self._conn.execute(sql, params).fetchall()]
 
@@ -875,21 +889,26 @@ class CheckpointDB:
         *,
         page_size: int = PENDING_PAGE_SIZE,
         due_at: float | None = None,
+        skip_expired: bool = False,
     ) -> Iterator[list[PendingMediaRow]]:
         """Lazily yield pages of pending media (one query per page, nothing held open)."""
         cats = list(categories)
-        after: tuple[str, int, str] | None = None
+        after: int | None = None
         while True:
             page = self.list_pending_media_page(
-                chat_key, cats, after=after, limit=page_size, due_at=due_at
+                chat_key,
+                cats,
+                after=after,
+                limit=page_size,
+                due_at=due_at,
+                skip_expired=skip_expired,
             )
             if not page:
                 return
             yield page
             if len(page) < page_size:
                 return
-            last = page[-1]
-            after = (last.day_str, last.msg_id, last.canonical_key)
+            after = page[-1].seq
 
     def list_pending_media(
         self,
@@ -906,34 +925,45 @@ class CheckpointDB:
         *,
         max_bytes: int | None,
         due_at: float,
+        skip_expired: bool = False,
     ) -> dict[str, int]:
-        """Counts for the drain: `due` (within the size limit, not backed off), `oversized`,
-        `retrying` (due items that failed before) and `backed_off`."""
+        """Counts for the drain: `due` (within the size limit, not backed off, and — with
+        `skip_expired` — not an expired file reference), `oversized`, `retrying` (due items
+        that failed before), `backed_off` and `expired` (skipped expired references)."""
+        keys = ("due", "oversized", "retrying", "backed_off", "expired")
         cats = list(categories)
         if not cats:
-            return {"due": 0, "oversized": 0, "retrying": 0, "backed_off": 0}
-        placeholders = ",".join("?" for _ in cats)
+            return dict.fromkeys(keys, 0)
+        named = ",".join(f":c{i}" for i in range(len(cats)))
         limit = max_bytes if max_bytes is not None else -1
+        skip = 1 if skip_expired else 0
+        eligible = (
+            "NOT (:lim >= 0 AND COALESCE(size_bytes, 0) > :lim) "
+            "AND (retry_after IS NULL OR retry_after <= :due)"
+        )
         row = self._conn.execute(
             f"""
             SELECT
-                SUM(CASE WHEN ? >= 0 AND COALESCE(size_bytes, 0) > ? THEN 1 ELSE 0 END)
-                    AS oversized,
-                SUM(CASE WHEN retry_after IS NOT NULL AND retry_after > ? THEN 1 ELSE 0 END)
-                    AS backed_off,
-                SUM(CASE WHEN NOT (? >= 0 AND COALESCE(size_bytes, 0) > ?)
-                          AND (retry_after IS NULL OR retry_after <= ?) THEN 1 ELSE 0 END)
-                    AS due,
-                SUM(CASE WHEN NOT (? >= 0 AND COALESCE(size_bytes, 0) > ?)
-                          AND (retry_after IS NULL OR retry_after <= ?)
-                          AND last_error IS NOT NULL THEN 1 ELSE 0 END)
+                SUM(:lim >= 0 AND COALESCE(size_bytes, 0) > :lim) AS oversized,
+                SUM(retry_after IS NOT NULL AND retry_after > :due) AS backed_off,
+                SUM({eligible} AND :skip AND {_EXPIRED_SQL}) AS expired,
+                SUM({eligible} AND NOT (:skip AND {_EXPIRED_SQL})) AS due,
+                SUM({eligible} AND NOT (:skip AND {_EXPIRED_SQL}) AND last_error IS NOT NULL)
                     AS retrying
             FROM pending_media
-            WHERE chat_key = ? AND downloaded = 0 AND category IN ({placeholders})
+            WHERE chat_key = :chat AND downloaded = 0 AND category IN ({named})
             """,
-            (limit, limit, due_at, limit, limit, due_at, limit, limit, due_at, chat_key, *cats),
+            {"lim": limit, "due": due_at, "skip": skip, "chat": chat_key}
+            | {f"c{i}": c for i, c in enumerate(cats)},
         ).fetchone()
-        return {k: int(row[k] or 0) for k in ("due", "oversized", "retrying", "backed_off")}
+        return {k: int(row[k] or 0) for k in keys}
+
+    def count_expired_media(self) -> int:
+        """Queued downloads that failed with an expired file reference (all chats)."""
+        row = self._conn.execute(
+            f"SELECT COUNT(*) AS n FROM pending_media WHERE downloaded = 0 AND {_EXPIRED_SQL}"
+        ).fetchone()
+        return int(row["n"] or 0)
 
     def record_media_failure(
         self,
@@ -960,22 +990,23 @@ class CheckpointDB:
             retry_after = permanent_failure_retry_after(
                 attempts, time.time() if now is None else now
             )
+        # REPLACE deletes and re-inserts in one statement: the item gets a new rowid, i.e. it
+        # goes to the back of the queue (first in, first out), keeping its attempt count.
         self._conn.execute(
             """
-            INSERT INTO pending_media (
+            INSERT OR REPLACE INTO pending_media (
                 chat_key, canonical_key, account_id, msg_id, day_str,
                 category, tg_type, tg_id, file_name, mime_type, size_bytes,
                 downloaded, attempts, last_error, retry_after
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
-            ON CONFLICT(chat_key, canonical_key) DO UPDATE SET
-                account_id = excluded.account_id,
-                msg_id = excluded.msg_id,
-                day_str = excluded.day_str,
-                downloaded = 0,
-                attempts = pending_media.attempts + 1,
-                last_error = excluded.last_error,
-                retry_after = excluded.retry_after
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0,
+                COALESCE(
+                    (SELECT attempts FROM pending_media WHERE chat_key = ? AND canonical_key = ?),
+                    0
+                ) + 1,
+                ?, ?
+            )
             """,
             (
                 row.chat_key,
@@ -989,6 +1020,8 @@ class CheckpointDB:
                 row.file_name,
                 row.mime_type,
                 row.size_bytes,
+                row.chat_key,
+                row.canonical_key,
                 error,
                 retry_after,
             ),

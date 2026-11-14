@@ -90,6 +90,7 @@ def _resolve_runtime_config(
     history_wait: float | None = None,
     auto_throttle: bool | None = None,
     metadata_every_hours: float | None = None,
+    retry_expired: bool | None = None,
 ):
     cfg = load_config(".env").with_overrides(
         data_dir=data_dir,
@@ -101,6 +102,7 @@ def _resolve_runtime_config(
         history_wait=history_wait,
         auto_throttle=auto_throttle,
         metadata_every_hours=metadata_every_hours,
+        retry_expired=retry_expired,
     )
     cfg.ensure_dirs()
     return cfg
@@ -265,6 +267,14 @@ def cmd_sync(
             help="Refresh the metadata of all chats now (ignores TGHOARD_METADATA_EVERY_HOURS).",
         ),
     ] = False,
+    retry_expired: Annotated[
+        bool,
+        typer.Option(
+            "--retry-expired",
+            help="Also retry downloads that failed with an expired file reference "
+            "(skipped by default; TGHOARD_RETRY_EXPIRED).",
+        ),
+    ] = False,
     no_auto_throttle: Annotated[
         bool,
         typer.Option(
@@ -335,6 +345,7 @@ def cmd_sync(
         history_wait=history_wait,
         auto_throttle=False if no_auto_throttle else None,
         metadata_every_hours=0 if refresh_metadata else None,
+        retry_expired=True if retry_expired else None,
     )
     _require_current_layout(cfg)
     manifest_path = chats_file or cfg.chats_manifest_path

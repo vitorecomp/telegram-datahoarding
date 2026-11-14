@@ -46,6 +46,8 @@ class AppConfig(BaseSettings):
     )
     # Auto-throttle: adapt history pause / parallelism to FloodWaits (floors/ceilings above)
     auto_throttle: bool = Field(default=True, validation_alias="TGHOARD_AUTO_THROTTLE")
+    # Retry downloads that failed with an expired file reference (skipped by default)
+    retry_expired: bool = Field(default=False, validation_alias="TGHOARD_RETRY_EXPIRED")
     # Geometric cut on each download FloodWait: parallelism x ratio (0.5 = halve)
     throttle_cut_ratio: float = Field(
         default=0.5, gt=0, lt=1, validation_alias="TGHOARD_THROTTLE_CUT_RATIO"
@@ -126,6 +128,7 @@ class AppConfig(BaseSettings):
         history_wait: float | None = None,
         auto_throttle: bool | None = None,
         metadata_every_hours: float | None = None,
+        retry_expired: bool | None = None,
     ) -> AppConfig:
         updates: dict[str, Any] = {}
         if data_dir is not None:
@@ -146,6 +149,8 @@ class AppConfig(BaseSettings):
             updates["metadata_every_hours"] = metadata_every_hours
         if sync_mode is not None:
             updates["sync_mode"] = sync_mode
+        if retry_expired is not None:
+            updates["retry_expired"] = retry_expired
         return self.model_copy(update=updates)
 
 

@@ -121,6 +121,11 @@ class MediaDownloadPool:
         self._emit()
         return future
 
+    async def wait_backlog(self, max_queued: int, *, poll: float = 0.2) -> None:
+        """Wait until at most `max_queued` jobs wait in the channel (just-in-time producers)."""
+        while self._queue.qsize() > max_queued and not self._closing:
+            await asyncio.sleep(poll)
+
     def cancel_group(self, group: str) -> int:
         """Cancel every queued/claimed/running job of `group` (e.g. a chat that aborted)."""
         n = 0

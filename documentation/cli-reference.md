@@ -12,6 +12,7 @@
 | `TGHOARD_MAX_JSON_KB` | `1024` | Target maximum size (in KB) per `messages/<folder>/YYYY-MM-ptNNN.json` file |
 | `TGHOARD_HISTORY_WAIT` | `0` | **Minimum** pause (s) between pages of 100 messages (Telethon would use a fixed 1 s on large chats). With auto-throttling, the pause rises by itself when there are FloodWaits |
 | `TGHOARD_DOWNLOAD_QUEUE` | `1024` | Downloads that can wait in the pool before holding back message reading (*backpressure*) |
+| `TGHOARD_RETRY_EXPIRED` | `false` | Retry downloads that failed with an expired file reference (same as `sync --retry-expired`); by default they stay queued but are skipped |
 | `TGHOARD_METADATA_EVERY_HOURS` | `24` | Each chat's metadata (info, members, stories, admin log, profile photos) is refreshed at most every N hours (`0` = every sync); messages and media always sync |
 | `TGHOARD_AUTO_THROTTLE` | `true` | Per-account auto-throttling: FloodWaits increase the pause between pages / reduce parallelism; periods without FloodWaits return to full speed |
 | `TGHOARD_WEB_PORT` | `8765` | Local web UI port (tries the next ones if it is busy) |
@@ -69,11 +70,14 @@ Reads `<data_dir>/chats.md` and syncs every chat checked with `[x] baixar`, in o
 | `--history-wait S` | Minimum pause between history pages (default `TGHOARD_HISTORY_WAIT` / `0`) |
 | `--no-auto-throttle` | Turn off FloodWait-based auto-throttling (uses the fixed values) |
 | `--refresh-metadata` | Refresh the metadata of all chats in this run (ignores `TGHOARD_METADATA_EVERY_HOURS`) |
+| `--retry-expired` | Also retry downloads that failed with an expired file reference (`FileReferenceExpiredError`); skipped by default (`TGHOARD_RETRY_EXPIRED`) |
 | `--skip-members`, `--skip-stories`, `--skip-profile-photos` | Skip those metadata steps |
 | `--chats-file PATH` | Use another `chats.md` |
 | `--no-web` | Do not start the web UI (pure CLI) |
 | `--web-port N` | Web UI port (default `TGHOARD_WEB_PORT` / `8765`) |
 | `-v` / `--verbose` | Detailed log in the terminal |
+
+**Download queue (FIFO) and expired file references.** Media waiting to be downloaded is processed in the order it was queued (first in, first out); a download that fails goes to the back of the queue. Telegram's file references can expire if too much time passes between fetching a message and downloading its file, so the queue fetches messages only shortly before their turn, and a download that still hits `FileReferenceExpiredError` re-fetches the message and retries once. Items that failed with an expired reference anyway are **not retried by default** (they stay queued and visible in the stats and in `verify-media`; the summary shows how many). `sync --retry-expired` retries them.
 
 **`--since`.** Messages older than the date are not fetched, and the skipped history is **not** marked as synced: a later `tghoard sync` without `--since` goes back and fetches it. New messages are always fetched.
 
@@ -116,7 +120,7 @@ Each adjustment shows up in the log (`🐢 FloodWait of 12s on GetFileRequest �
 
 **Join date.** The *Joined* column (sortable) shows when you joined each channel/group (the oldest account; the tooltip lists each account and, in basic groups, who invited you).
 
-**Telegram folders in the web UI.** The *All folders* filter shows only the chats of one of your Telegram folders (from `folders.md`); combined with *apply to visible → Check*, it checks download (`baixar`)/`photos`/… for an entire folder at once.
+**Telegram folders in the web UI.** The *All folders* filter shows only the chats of one of your Telegram folders (from `folders.md`), grouped by the account each folder belongs to (`👤 alias`, also shown next to the folder name); combined with *apply to visible → Check*, it checks download (`baixar`)/`photos`/… for an entire folder at once.
 
 **Statistics in the web UI.** For each chat: the chat photo (downloaded on demand, cached in `.tghoard/avatars/`) and **downloaded / total on Telegram** for messages, photos, videos, audio and files. The totals come from `messages.getHistory` (count) and `messages.getSearchCounters`, are requested only for the visible rows and are cached for 6 h in `.tghoard/remote_counts.json` (`tghoard web` without a connection shows the last known value). Media folders only exist once something has been downloaded into them.
 

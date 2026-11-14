@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from rich.markup import escape
+from telethon import errors as tg_errors
 
 from tghoard.storage.chat_writer import (
     ChatPartWriter,
@@ -70,6 +71,10 @@ TAIL_CHECK_MAX_IDS = 1000
 # DM/basic-group forward walk: persist the forward cursor at least every N walked messages.
 FORWARD_CURSOR_EVERY = 1000
 PENDING_FETCH_CHUNK = 100  # messages re-fetched per request to refresh file references
+# The queue drain fetches the next chunk of messages only once the download pool's backlog
+# is this small: a file reference fetched long before its download (behind big videos at a
+# throttled parallelism) expires — FileReferenceExpiredError.
+PENDING_MAX_BACKLOG = 100
 PENDING_PAGE_SIZE = 1000  # queue rows read per query (the queue is streamed, never loaded)
 # Pending-media drain: finished downloads are written to their JSON part in groups (one
 # rewrite per part per flush, instead of one full-part rewrite per file).
@@ -143,22 +148,49 @@ def _make_downloader(
     size_bytes: int | None,
     label: str,
     description: str,
+    entity: Any = None,
 ) -> Any:
-    """Downloader callable for MediaManager, with a live byte bar for large files."""
+    """Downloader callable for MediaManager, with a live byte bar for large files.
+
+    A file reference can expire while the download waits in the pool's queue: on
+    `FileReferenceExpiredError` the message is fetched again (fresh reference) and the
+    download retried once.
+    """
+    peer = entity if entity is not None else getattr(msg, "peer_id", None)
+    msg_id = getattr(msg, "id", None)
+
+    async def _refetch() -> Any:
+        if peer is None or msg_id is None:
+            return None
+        return await limiter.call(
+            lambda: client.get_messages(peer, ids=msg_id),
+            description=f"refresh_file_reference({description})",
+        )
 
     async def _download(target: Path) -> Any:
         bar = reporter.download_bar(label, size_bytes)
         kwargs: dict[str, Any] = {}
         if bar is not NULL_BAR:
             kwargs["progress_callback"] = lambda cur, tot: bar.update(completed=cur, total=tot)
-        try:
+
+        def _get(message: Any) -> Any:
             # Concurrency is governed by the MediaDownloadPool, not the API limiter's slots
             # (so history/API calls never queue behind long downloads).
-            return await limiter.call(
-                lambda: client.download_media(msg, file=str(target), **kwargs),
+            return limiter.call(
+                lambda: client.download_media(message, file=str(target), **kwargs),
                 description=description,
                 use_slots=False,
             )
+
+        try:
+            try:
+                return await _get(msg)
+            except tg_errors.FileReferenceExpiredError:
+                fresh = await _refetch()
+                if fresh is None or getattr(fresh, "media", None) is None:
+                    raise
+                reporter.debug(f"↻ file reference refreshed — {description}")
+                return await _get(fresh)
         finally:
             bar.remove()
 
@@ -423,6 +455,7 @@ async def _sync_chat_messages_impl(
     history_wait: float = 0.0,
     pacer: FloodController | None = None,
     media_pool: MediaDownloadPool,
+    retry_expired: bool = False,
 ) -> ChatSyncResult:
     chat_key = selection.chat_key
     res = ChatSyncResult(chat_key=chat_key)
@@ -485,6 +518,7 @@ async def _sync_chat_messages_impl(
         limiter=limiter,
         reporter=reporter,
         media_pool=media_pool,
+        retry_expired=retry_expired,
     )
     res.retroactive_media_downloaded = retro_dl
 
@@ -1207,14 +1241,17 @@ async def drain_pending_media(
     limiter: RateLimiter,
     reporter: SyncReporter = NULL_REPORTER,
     media_pool: MediaDownloadPool,
+    retry_expired: bool = False,
 ) -> int:
     """Download media for categories newly checked in `chats.md` on previously synced messages.
 
-    A streaming pipeline over the chat's queue, read in pages of 1000 rows (never the whole
-    queue in memory): items already in `media_index` are linked locally; the rest are
-    re-fetched 100 at a time (fresh `file_reference`) and handed to the account's download
-    pool right away (its bounded channel paces the fetching). Finished files are recorded in
-    batches (`_MediaAttacher`), also when interrupted.
+    A streaming pipeline over the chat's queue, in queue order (first in, first out; failed
+    items go to the back), read in pages of 1000 rows (never the whole queue in memory):
+    items already in `media_index` are linked locally; the rest are re-fetched 100 at a time
+    (fresh `file_reference`) only when the download pool's backlog is small, so references
+    don't expire while waiting. Downloads that already failed with an expired reference are
+    skipped unless `retry_expired`. Finished files are recorded in batches
+    (`_MediaAttacher`), also when interrupted.
     """
     enabled_cats = selection.enabled_categories()
     if not enabled_cats:
@@ -1223,7 +1260,15 @@ async def drain_pending_media(
     now = time.time()
     # Oversized items stay queued (cheap check, no RPC) until TGHOARD_MAX_MEDIA_MB is raised.
     max_bytes = media_manager.max_media_bytes
-    summary = db.pending_media_summary(chat_key, enabled_cats, max_bytes=max_bytes, due_at=now)
+    skip_expired = not retry_expired
+    summary = db.pending_media_summary(
+        chat_key, enabled_cats, max_bytes=max_bytes, due_at=now, skip_expired=skip_expired
+    )
+    if summary["expired"]:
+        reporter.debug(
+            f"⏭ {summary['expired']} file(s) whose file reference expired are not retried "
+            "(sync --retry-expired)"
+        )
     if summary["oversized"]:
         reporter.debug(f"⏭ {summary['oversized']} queued media file(s) above max_media_mb (kept)")
     if summary["backed_off"]:
@@ -1316,6 +1361,8 @@ async def drain_pending_media(
 
     async def _fetch_and_submit(rows: list[PendingMediaRow]) -> None:
         nonlocal failed
+        # Fetch just in time: references fetched now are used within the current backlog
+        await media_pool.wait_backlog(PENDING_MAX_BACKLOG)
         ids = [r.msg_id for r in rows]
         fetched = await limiter.call(
             lambda: client.get_messages(entity, ids=ids),
@@ -1355,6 +1402,7 @@ async def drain_pending_media(
                     size_bytes=row.size_bytes,
                     label=f"{escape(selection.title[:24])} #{row.msg_id} ({row.category})",
                     description=f"download_pending({row.chat_key}#{row.msg_id})",
+                    entity=entity,
                 ),
             )
             # waits only while the pool's channel is full (backpressure)
@@ -1367,7 +1415,11 @@ async def drain_pending_media(
     to_fetch: list[PendingMediaRow] = []
     try:
         for page in db.iter_pending_media_pages(
-            chat_key, enabled_cats, page_size=PENDING_PAGE_SIZE, due_at=now
+            chat_key,
+            enabled_cats,
+            page_size=PENDING_PAGE_SIZE,
+            due_at=now,
+            skip_expired=skip_expired,
         ):
             for row in page:
                 if max_bytes is not None and (row.size_bytes or 0) > max_bytes:

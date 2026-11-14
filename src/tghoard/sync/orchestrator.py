@@ -74,6 +74,7 @@ class OrchestratorStats:
     retroactive_media_downloaded: int = 0
     media_failed: int = 0
     media_failed_pending_total: int = 0
+    media_expired_skipped_total: int = 0  # expired file references, not retried by default
     failed_chats: list[tuple[str, str, str]] = field(default_factory=list)
     # (alias, reason): accounts that stopped early (e.g. revoked session); the others went on
     failed_accounts: list[tuple[str, str]] = field(default_factory=list)
@@ -175,6 +176,7 @@ async def run_multi_account_sync(
 
     totals.chats_synced = len(ctx.synced_chat_keys)
     totals.media_failed_pending_total = db.count_failed_media()
+    totals.media_expired_skipped_total = 0 if config.retry_expired else db.count_expired_media()
     ctx.reporter.info(f"🏁 sync finished in {clock}")
     _print_summary_table(out, totals)
     if ctx.account_errors and len(ctx.account_errors) == len(account_clients):
@@ -789,6 +791,7 @@ async def _sync_one_chat(
         history_wait=config.history_wait,
         pacer=pacer,
         media_pool=media_pool,
+        retry_expired=config.retry_expired,
     )
 
     # Metadata changes slowly and costs several requests per chat: refresh it at most every
@@ -849,6 +852,11 @@ def _print_summary_table(console: Console, stats: OrchestratorStats) -> None:
     table.add_row("Attachments deferred (checkbox unchecked)", str(stats.media_deferred))
     table.add_row("Attachments failed in this run", str(stats.media_failed))
     table.add_row("Attachments awaiting retry (total)", str(stats.media_failed_pending_total))
+    if stats.media_expired_skipped_total:
+        table.add_row(
+            "…of which expired references, not retried (sync --retry-expired)",
+            str(stats.media_expired_skipped_total),
+        )
     table.add_row("Failed chats (resumed next sync)", str(len(stats.failed_chats)))
     if stats.failed_accounts:
         table.add_row("Accounts stopped early", str(len(stats.failed_accounts)))

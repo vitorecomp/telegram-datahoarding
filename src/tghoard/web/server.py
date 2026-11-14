@@ -284,15 +284,23 @@ class WebUI:
         return report.to_dict()
 
     def _folders(self) -> list[dict[str, Any]]:
-        """Telegram chat folders of every account (from `.tghoard/folders.json`)."""
+        """Telegram chat folders of every account (from `.tghoard/folders.json`).
+
+        Each folder carries the account (alias) it belongs to: the page groups them by it.
+        """
         state = load_folders(self.data_dir)
-        multi = len(state.get("accounts", {})) > 1
         out = []
         for alias, acc in sorted(state.get("accounts", {}).items()):
             for f in acc.get("folders", []):
                 icon = f.get("emoticon") or "📁"
-                label = f"{icon} {f['title']}" + (f" ({alias})" if multi else "")
-                out.append({"key": f"{alias}:{f['id']}", "label": label, "members": f["members"]})
+                out.append(
+                    {
+                        "key": f"{alias}:{f['id']}",
+                        "account": alias,
+                        "label": f"{icon} {f['title']}",
+                        "members": f["members"],
+                    }
+                )
         return out
 
     # -- HTTP -----------------------------------------------------------------

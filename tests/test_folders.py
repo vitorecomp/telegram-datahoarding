@@ -143,6 +143,7 @@ async def test_web_ui_exposes_folders_for_filtering(tmp_path: Path) -> None:
         ui.stop()
     by_key = {f["key"]: f for f in data["folders"]}
     assert by_key["conta1:2"]["label"] == "💼 Trabalho"
+    assert by_key["conta1:2"]["account"] == "conta1"  # the page groups folders by account
     assert by_key["conta1:3"]["members"] == ["supergroup_11", "supergroup_12"]
 
 
